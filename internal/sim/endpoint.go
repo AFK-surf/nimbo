@@ -421,8 +421,9 @@ func (e *Endpoint) transfer(c *Conn, h *heldCap, to *Endpoint) {
 	in := &wire.In{Op: "transfer", Cap: h.id.String(), To: to.key.String(), Durable: !h.singleUse}
 	e.w.check.stats.Transfers++
 	e.w.check.useAttempt(e, h)
+	sentAt := e.w.now
 	e.request(c, in, func(out *wire.Out) {
-		e.w.check.useResult(e, h, out, useTransfer)
+		e.w.check.useResult(e, h, out, useTransfer, sentAt)
 		if out == nil || !out.OK {
 			if out != nil && terminal(out.Error.Code) {
 				e.dropCap(h)
@@ -504,11 +505,12 @@ func (e *Endpoint) doSend(c *Conn, h *heldCap) {
 	for _, ch := range carried {
 		e.w.check.useAttempt(e, ch)
 	}
+	sentAt := e.w.now
 	e.request(c, in, func(out *wire.Out) {
 		e.w.check.sendResult(rec, out)
-		e.w.check.useResult(e, h, out, useSend)
+		e.w.check.useResult(e, h, out, useSend, sentAt)
 		for _, ch := range carried {
-			e.w.check.useResult(e, ch, out, useSend)
+			e.w.check.useResult(e, ch, out, useSend, sentAt)
 		}
 		if out != nil && out.OK {
 			if h.singleUse {
@@ -545,17 +547,18 @@ func (e *Endpoint) doRenew(c *Conn) {
 		e.w.check.useAttempt(e, h)
 	}
 	e.w.check.stats.Renews++
+	sentAt := e.w.now
 	e.request(c, in, func(out *wire.Out) {
 		if out == nil || !out.OK {
 			for _, h := range hs {
-				e.w.check.useResult(e, h, out, useRenew)
+				e.w.check.useResult(e, h, out, useRenew, sentAt)
 			}
 			return
 		}
 		for i, h := range hs {
 			item := out.Renewed[i]
 			o := &wire.Out{OK: item.OK, Error: item.Error}
-			e.w.check.useResult(e, h, o, useRenew)
+			e.w.check.useResult(e, h, o, useRenew, sentAt)
 			if item.Error != nil && terminal(item.Error.Code) {
 				e.dropCap(h)
 			}
@@ -568,8 +571,9 @@ func (e *Endpoint) doInspect(c *Conn) {
 	if h == nil {
 		return
 	}
+	sentAt := e.w.now
 	e.request(c, &wire.In{Op: "inspect", Cap: h.id.String()}, func(out *wire.Out) {
-		e.w.check.inspected(e, h, out)
+		e.w.check.inspected(e, h, out, sentAt)
 	})
 }
 

@@ -35,6 +35,8 @@ type Config struct {
 	Limits     node.Limits
 	// Log receives a human-readable event log if set.
 	Log io.Writer
+	// S3Latency overrides the S3 request latency range [min, max).
+	S3Latency [2]time.Duration
 	// Script, if set, schedules scripted events (see Crash, Partition and
 	// ExpectStable) instead of or in addition to random faults.
 	Script func(w *World)
@@ -519,3 +521,14 @@ func (w *World) ResetAccounting() {
 
 // AccountingWindow is how long the counters have been running.
 func (w *World) AccountingWindow() time.Duration { return w.now - w.accountFrom }
+
+// AddBroker starts a new Broker (a new node key) at t: a scale-up.
+func (w *World) AddBroker(t time.Duration) {
+	w.At(t, func() {
+		b := newBroker(w, len(w.brokers))
+		w.brokers = append(w.brokers, b)
+		w.byID[b.id] = b
+		w.logf("%s JOINS", b)
+		b.start()
+	})
+}

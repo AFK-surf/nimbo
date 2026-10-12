@@ -134,6 +134,7 @@ type Node struct {
 	viewChangedAt time.Time
 	departed      map[presence.RegKey]time.Time
 	s3Offset      time.Duration
+	learnSeq      uint64
 	offSamples    []time.Duration
 	s3OffsetOK    bool
 	lastHB        time.Time // S3 time of the last successful heartbeat

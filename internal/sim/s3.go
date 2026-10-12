@@ -31,7 +31,11 @@ var errS3 = errors.New("simulated S3 failure")
 func (s *S3) do(e *brokerEnv, req node.S3Request, done func(node.S3Response)) {
 	w := s.w
 	b := e.b
-	lat := w.dur(5*time.Millisecond, 60*time.Millisecond)
+	lo, hi := 5*time.Millisecond, 60*time.Millisecond
+	if w.cfg.S3Latency[1] > 0 {
+		lo, hi = w.cfg.S3Latency[0], w.cfg.S3Latency[1]
+	}
+	lat := w.dur(lo, hi)
 	w.check.stats.S3Ops[map[node.S3Op]string{node.S3Get: "GET", node.S3Put: "PUT", node.S3List: "LIST", node.S3Delete: "DELETE"}[req.Op]]++
 	fail := b.s3Broken || (w.faultsOn && w.chance(w.cfg.Faults.S3ErrorRate))
 	body := append([]byte(nil), req.Body...)

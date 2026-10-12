@@ -21,6 +21,10 @@ type member struct {
 	inc      uint64
 	draining bool
 	lastSeen time.Time // S3 time
+	// learned orders membership knowledge on this Broker: it is taken from
+	// a counter when the information is obtained (a Rejoin or frame is
+	// received, or the S3 request that returned it is issued).
+	learned uint64
 }
 
 type view struct {
@@ -86,7 +90,7 @@ func (n *Node) memberJSON() []byte {
 }
 
 func (n *Node) selfMember() *member {
-	return &member{id: n.id, info: n.memberInfo(), inc: n.inc, draining: n.draining, lastSeen: n.s3Now()}
+	return &member{id: n.id, info: n.memberInfo(), inc: n.inc, draining: n.draining, lastSeen: n.s3Now(), learned: n.learn()}
 }
 
 // parseMember validates a member object against the Broker ID it is filed
@@ -168,6 +172,7 @@ func (n *Node) poll() {
 	}
 	n.pollInFlight = true
 	start := n.env.Wall()
+	listStart := n.learn()
 	n.env.S3(S3Request{Op: S3List, Key: "members/"}, func(r S3Response) {
 		if n.stopped {
 			return
@@ -202,6 +207,7 @@ func (n *Node) poll() {
 				if o.LastModified.After(m.lastSeen) {
 					m.lastSeen = o.LastModified
 				}
+				m.learned = max(m.learned, listStart)
 				next[id] = &m
 				continue
 			}
@@ -209,6 +215,21 @@ func (n *Node) poll() {
 		}
 		finish := func() {
 			n.pollInFlight = false
+			// The LIST is a snapshot from listStart. What this Broker
+			// learned since (a Rejoin, a fast join, a frame carrying a new
+			// incarnation) is newer and wins; otherwise applying the
+			// snapshot would drop a member that just joined, or roll back
+			// a restart or a draining flag.
+			for _, id := range sortedBrokerKeys(n.view.members) {
+				cur := n.view.members[id]
+				if id == n.id || cur.learned <= listStart {
+					continue
+				}
+				if nx := next[id]; nx == nil || cur.learned > nx.learned {
+					c := *cur
+					next[id] = &c
+				}
+			}
 			n.applyMembers(next)
 			if !n.ready {
 				n.ready = true
@@ -230,17 +251,9 @@ func (n *Node) poll() {
 				}
 				if g.Err == nil && !g.NotFound {
 					if m, ok := parseMember(nd.id, g.Body); ok {
-						m.lastSeen = nd.lm
-						cur := n.view.members[nd.id]
-						if cur != nil && cur.inc != m.inc && !nd.lm.After(cur.lastSeen) {
-							// A Rejoin told us about a newer incarnation
-							// than this object: keep it.
-							c := *cur
-							next[nd.id] = &c
-						} else {
-							next[nd.id] = m
-							n.knownETags[nd.id] = nd.etag
-						}
+						m.lastSeen, m.learned = nd.lm, listStart
+						next[nd.id] = m
+						n.knownETags[nd.id] = nd.etag
 					}
 				} else if cur := n.view.members[nd.id]; cur != nil && g.Err != nil {
 					m := *cur
@@ -361,7 +374,7 @@ func (n *Node) handleRejoin(from ids.BrokerID, rj *peerproto.Rejoin) {
 	if !ok {
 		return
 	}
-	m.lastSeen = n.s3Now()
+	m.lastSeen, m.learned = n.s3Now(), n.learn()
 	next := n.copyMembers()
 	next[from] = m
 	n.applyMembers(next)
@@ -373,7 +386,7 @@ func (n *Node) observeIncarnation(from ids.BrokerID, inc uint64) {
 	next := n.copyMembers()
 	m := next[from]
 	m.inc = inc
-	m.lastSeen = n.s3Now()
+	m.lastSeen, m.learned = n.s3Now(), n.learn()
 	n.applyMembers(next)
 }
 
@@ -391,6 +404,7 @@ func (n *Node) fastJoin(id ids.BrokerID) {
 	}
 	n.fastJoinBusy[id] = true
 	start := n.env.Wall()
+	issued := n.learn()
 	n.env.S3(S3Request{Op: S3Get, Key: memberKey(id)}, func(r S3Response) {
 		if n.stopped {
 			return
@@ -406,7 +420,7 @@ func (n *Node) fastJoin(id ids.BrokerID) {
 			n.fastJoinNeg[id] = n.now().Add(n.tun.FastJoinNegTTL)
 			return
 		}
-		m.lastSeen = r.LastModified
+		m.lastSeen, m.learned = r.LastModified, issued
 		n.knownETags[id] = r.ETag
 		next := n.copyMembers()
 		next[id] = m
@@ -507,5 +521,14 @@ func (n *Node) UpdateMemberInfo(f func(*MemberInfo)) {
 	}
 	n.after(0, n.heartbeat)
 	n.applyMembers(n.copyMembers())
-	n.announce()
+	if !n.fenced {
+		// A fenced Broker must not re-announce itself: peers may have
+		// declared it dead, and it rejoins when it unfences.
+		n.announce()
+	}
+}
+
+func (n *Node) learn() uint64 {
+	n.learnSeq++
+	return n.learnSeq
 }

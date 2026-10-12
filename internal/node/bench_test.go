@@ -38,6 +38,11 @@ type bench struct {
 	eps    map[*Node]map[SessionID]*benchEP
 	frames uint64 // peer frames
 	bytes  uint64 // peer bytes
+
+	holdList map[*Node]bool // hold back LIST responses to these nodes
+	holdS3   map[*Node]bool // hold back every S3 response to these nodes
+	started  int
+	heldList []func()
 }
 
 type benchObj struct {
@@ -118,34 +123,40 @@ func (e *benchEnv) SendSession(s SessionID, frame []byte) bool {
 func (e *benchEnv) CloseSession(SessionID) {}
 func (e *benchEnv) S3(req S3Request, done func(S3Response)) {
 	b := e.b
-	b.q = append(b.q, func() {
-		resp := S3Response{Date: b.now.Truncate(time.Second)}
-		switch req.Op {
-		case S3Put:
-			b.s3[req.Key] = benchObj{body: append([]byte(nil), req.Body...), lm: b.now}
-			resp.ETag = fmt.Sprint(len(req.Body), string(req.Body))
-		case S3Get:
-			o, ok := b.s3[req.Key]
-			resp.NotFound = !ok
-			resp.Body, resp.LastModified, resp.ETag = o.body, o.lm, fmt.Sprint(len(o.body), string(o.body))
-		case S3List:
-			var keys []string
-			for k := range b.s3 {
-				if strings.HasPrefix(k, req.Key) {
-					keys = append(keys, k)
-				}
+	// The request takes effect now; the response is delivered later (and
+	// can be held back by a test to reorder it against other events).
+	resp := S3Response{Date: b.now.Truncate(time.Second)}
+	switch req.Op {
+	case S3Put:
+		b.s3[req.Key] = benchObj{body: append([]byte(nil), req.Body...), lm: b.now}
+		resp.ETag = fmt.Sprint(len(req.Body), string(req.Body))
+	case S3Get:
+		o, ok := b.s3[req.Key]
+		resp.NotFound = !ok
+		resp.Body, resp.LastModified, resp.ETag = o.body, o.lm, fmt.Sprint(len(o.body), string(o.body))
+	case S3List:
+		var keys []string
+		for k := range b.s3 {
+			if strings.HasPrefix(k, req.Key) {
+				keys = append(keys, k)
 			}
-			sort.Strings(keys)
-			for _, k := range keys {
-				o := b.s3[k]
-				resp.Objects = append(resp.Objects, S3Object{Key: k, ETag: fmt.Sprint(len(o.body), string(o.body)), LastModified: o.lm})
-			}
-		case S3Delete:
-			delete(b.s3, req.Key)
 		}
-		done(resp)
-	})
+		sort.Strings(keys)
+		for _, k := range keys {
+			o := b.s3[k]
+			resp.Objects = append(resp.Objects, S3Object{Key: k, ETag: fmt.Sprint(len(o.body), string(o.body)), LastModified: o.lm})
+		}
+	case S3Delete:
+		delete(b.s3, req.Key)
+	}
+	deliver := func() { done(resp) }
+	if b.holdS3[e.n] || (req.Op == S3List && b.holdList[e.n]) {
+		b.heldList = append(b.heldList, deliver)
+		return
+	}
+	b.q = append(b.q, deliver)
 }
+
 func (e *benchEnv) MembersChanged([]Member)         {}
 func (e *benchEnv) Left()                           {}
 func (e *benchEnv) Logf(format string, args ...any) {}
@@ -180,24 +191,9 @@ func (b *bench) advance(d time.Duration) {
 }
 
 func newBench(tb testing.TB, brokers int) *bench {
-	b := &bench{tb: tb, now: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), byID: map[ids.BrokerID]*Node{}, s3: map[string]benchObj{}, eps: map[*Node]map[SessionID]*benchEP{}}
+	b := &bench{tb: tb, now: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), byID: map[ids.BrokerID]*Node{}, s3: map[string]benchObj{}, eps: map[*Node]map[SessionID]*benchEP{}, holdList: map[*Node]bool{}, holdS3: map[*Node]bool{}}
 	for i := 0; i < brokers; i++ {
-		var seed [32]byte
-		seed[0], seed[1] = byte(i), byte(i>>8)
-		pub := make([]byte, 32)
-		rand.NewChaCha8(seed).Read(pub)
-		env := &benchEnv{b: b, rng: rand.NewChaCha8([32]byte{byte(i), byte(i >> 8), 1})}
-		lim := DefaultLimits()
-		// The harness drives one session as fast as the CPU allows.
-		lim.ActionsPerSec, lim.ActionsBurst, lim.MintsPerSec, lim.MintsBurst = 1e12, 1e12, 1e12, 1e12
-		lim.MintAdmission, lim.MaxLiveCaps = 1e12, 1<<30
-		lim.CapsUsedPer10s, lim.UnknownPer10s, lim.BlobBytesPer10s = 1<<30, 1<<30, 1<<30
-		lim.SessionsPerIP, lim.HandshakesPerSec, lim.HandshakeBurst = 1<<30, 1e12, 1e12
-		n := New(Config{NodePub: pub, PublicNames: []string{"b.bench"}, Tunables: DefaultTunables(), Limits: lim}, env)
-		env.n = n
-		b.nodes = append(b.nodes, n)
-		b.byID[n.id] = n
-		b.eps[n] = map[SessionID]*benchEP{}
+		b.addNode(i)
 	}
 	for _, n := range b.nodes {
 		n.Start()
@@ -210,6 +206,30 @@ func newBench(tb testing.TB, brokers int) *bench {
 		}
 	}
 	return b
+}
+
+// addNode creates (but does not start) Broker number i.
+func (b *bench) addNode(i int) *Node {
+	{
+		var seed [32]byte
+		seed[0], seed[1] = byte(i), byte(i>>8)
+		pub := make([]byte, 32)
+		rand.NewChaCha8(seed).Read(pub)
+		b.started++ // a restarted Broker gets a new randomness stream
+		env := &benchEnv{b: b, rng: rand.NewChaCha8([32]byte{byte(i), byte(i >> 8), 1, byte(b.started), byte(b.started >> 8)})}
+		lim := DefaultLimits()
+		// The harness drives one session as fast as the CPU allows.
+		lim.ActionsPerSec, lim.ActionsBurst, lim.MintsPerSec, lim.MintsBurst = 1e12, 1e12, 1e12, 1e12
+		lim.MintAdmission, lim.MaxLiveCaps = 1e12, 1<<30
+		lim.CapsUsedPer10s, lim.UnknownPer10s, lim.BlobBytesPer10s = 1<<30, 1<<30, 1<<30
+		lim.SessionsPerIP, lim.HandshakesPerSec, lim.HandshakeBurst = 1<<30, 1e12, 1e12
+		n := New(Config{NodePub: pub, PublicNames: []string{"b.bench"}, Tunables: DefaultTunables(), Limits: lim}, env)
+		env.n = n
+		b.nodes = append(b.nodes, n)
+		b.byID[n.id] = n
+		b.eps[n] = map[SessionID]*benchEP{}
+		return n
+	}
 }
 
 // benchEP is a minimal endpoint client.
