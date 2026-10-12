@@ -38,14 +38,15 @@ type sendRec struct {
 		auto, schema bool
 		base         string
 	}
-	fifoSeq  int
-	sentAt   time.Duration
-	resultAt time.Duration
-	status   sendStatus
-	code     string
-	msgID    string
-	replyID  string
-	expected bool
+	fifoSeq    int
+	sentAt     time.Duration
+	resultAt   time.Duration
+	status     sendStatus
+	code       string
+	msgID      string
+	replyID    string
+	expected   bool
+	expectGone bool
 
 	deliveries  int
 	deliveredAt time.Duration
@@ -61,6 +62,7 @@ type Checker struct {
 	replyDelivered map[string]int
 	fifoLast       map[fifoKey]int
 	attempts       map[*heldCap]int
+	bounces        map[string]string // msg ID -> reason
 	violations     []string
 	stats          Stats
 }
@@ -73,6 +75,7 @@ func newChecker(w *World) *Checker {
 		replyDelivered: map[string]int{},
 		fifoLast:       map[fifoKey]int{},
 		attempts:       map[*heldCap]int{},
+		bounces:        map[string]string{},
 		stats:          Stats{Errors: map[string]int{}},
 	}
 }
@@ -104,16 +107,25 @@ func (c *Checker) sent(rec *sendRec) {
 	c.stats.Sends++
 	h := rec.from.byID[rec.cap.id]
 	first := h != nil && c.attempts[h] == 0
-	exp := c.quietSettled() && rec.cap.fresh && first && !rec.cap.contested && rec.violate == "" &&
+	stable := c.quietSettled() || (w.stableFrom > 0 && w.now >= w.stableFrom && (w.stableUntil == 0 || w.now < w.stableUntil))
+	fresh := rec.cap.fresh || (w.stableFrom > 0 && w.now >= w.stableFrom && rec.cap.obtained < w.lossFreeBefore)
+	exp := stable && fresh && first && !rec.cap.contested && rec.violate == "" &&
 		w.now-rec.cap.lastUse < 40*time.Second &&
 		!rec.cap.target.retired && rec.cap.target.connected() && rec.from.connected() &&
 		w.now < w.cfg.FaultPhase+w.cfg.Quiet-20*time.Second
 	for _, ch := range rec.carried {
-		if !ch.fresh || ch.singleUse || w.now-ch.lastUse > 40*time.Second {
+		if ch.singleUse || w.now-ch.lastUse > 40*time.Second || !(ch.fresh || (w.stableFrom > 0 && ch.obtained < w.lossFreeBefore)) {
 			exp = false
 		}
 	}
 	rec.expected = exp
+	if w.goneFrom > 0 && w.now >= w.goneFrom && rec.cap.target.retired && rec.violate == "" && w.now-rec.cap.lastUse < 40*time.Second {
+		for _, g := range w.goneTargets {
+			if g == rec.cap.target {
+				rec.expectGone = true
+			}
+		}
+	}
 }
 
 func (c *Checker) useAttempt(e *Endpoint, h *heldCap) { c.attempts[h]++ }
@@ -126,6 +138,9 @@ func (c *Checker) sendResult(rec *sendRec, out *wire.Out) {
 		rec.status = stUnknown
 	case out.OK:
 		rec.status = stOK
+		if rec.expectGone {
+			c.violate("send %s to an endpoint gone with its broker succeeded", rec.nonce)
+		}
 		rec.msgID, rec.replyID = out.Msg, out.ReplyID
 		c.stats.SendOK++
 		if rec.violate != "" {
@@ -137,6 +152,13 @@ func (c *Checker) sendResult(rec *sendRec, out *wire.Out) {
 	default:
 		rec.status = stFailed
 		rec.code = out.Error.Code
+		if rec.code == wire.ErrTargetGone {
+			for _, g := range c.w.goneTargets {
+				if g == rec.cap.target {
+					c.stats.ExpectedGone++
+				}
+			}
+		}
 		if rec.violate == "" && (rec.code == wire.ErrSchemaViolation || rec.code == wire.ErrBaseConflict) {
 			c.violate("send %s: unexpected %s (%s)", rec.nonce, rec.code, out.Error.Detail)
 		}
@@ -198,6 +220,11 @@ func (c *Checker) inspected(e *Endpoint, h *heldCap, out *wire.Out) {
 	} else if out.Info.Target != h.target.key.String() {
 		c.violate("%s: inspect returned wrong target", e.name)
 	}
+}
+
+func (c *Checker) bounced(e *Endpoint, out *wire.Out) {
+	c.stats.Bounced++
+	c.bounces[out.Msg] = out.Reason
 }
 
 func (c *Checker) delivered(e *Endpoint, conn *Conn, out *wire.Out) {
@@ -278,6 +305,9 @@ func (c *Checker) finalChecks() {
 	end := w.cfg.FaultPhase + w.cfg.Quiet
 	tun := w.cfg.Tunables
 	for _, rec := range c.order {
+		if reason, ok := c.bounces[rec.msgID]; ok && rec.msgID != "" && rec.deliveries > 0 {
+			c.violate("message %s was delivered and also bounced (%s)", rec.nonce, reason)
+		}
 		if rec.deliveries > 0 {
 			if rec.status == stFailed {
 				c.violate("message %s delivered although its send failed with %s", rec.nonce, rec.code)

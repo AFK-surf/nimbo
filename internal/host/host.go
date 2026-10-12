@@ -5,8 +5,8 @@ package host
 
 import (
 	"context"
-	"fmt"
 	"crypto/rand"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"

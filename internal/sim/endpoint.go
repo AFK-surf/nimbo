@@ -118,7 +118,9 @@ func (e *Endpoint) ensureConns() {
 			return
 		}
 		b := cands[e.w.rng.IntN(len(cands))]
-		e.conns = append(e.conns, e.w.dial(e, b, e.ip))
+		c := e.w.dial(e, b, e.ip)
+		c.forge = e.w.chance(0.03)
+		e.conns = append(e.conns, c)
 	}
 }
 
@@ -155,9 +157,22 @@ func (e *Endpoint) onFrame(c *Conn, data []byte) {
 		if err != nil {
 			return
 		}
-		proof := wire.Proof(ss, nonce, c.b.name, e.key[:], eph)
-		e.send(c, wire.In{Op: "hello", Key: e.key.String(), Authority: c.b.name, Proof: ids.B32.EncodeToString(proof), Client: "sim/1", MaxMessageBytes: e.maxMsg})
+		authority := c.b.name
+		if c.forge {
+			// A malicious relay answers with a proof for its own name, or
+			// claims the real name with a proof for another: both fail.
+			if e.w.chance(0.5) {
+				authority = "evil.example"
+			} else {
+				nonce[0] ^= 1
+			}
+		}
+		proof := wire.Proof(ss, nonce, authority, e.key[:], eph)
+		e.send(c, wire.In{Op: "hello", Key: e.key.String(), Authority: authority, Proof: ids.B32.EncodeToString(proof), Client: "sim/1", MaxMessageBytes: e.maxMsg})
 	case "welcome":
+		if c.forge {
+			e.w.check.violate("%s: forged handshake accepted by %s", e.name, c.b)
+		}
 		c.ready = true
 		c.readyAt = e.w.now
 		e.backoff = 250 * time.Millisecond
@@ -172,7 +187,7 @@ func (e *Endpoint) onFrame(c *Conn, data []byte) {
 	case "deliver":
 		e.w.check.delivered(e, c, &out)
 	case "bounce":
-		e.w.check.stats.Bounced++
+		e.w.check.bounced(e, &out)
 	case "closing":
 		if out.RetryAfterMs > 0 {
 			e.backoff = time.Duration(out.RetryAfterMs) * time.Millisecond
@@ -325,8 +340,15 @@ func (e *Endpoint) act() {
 		e.doMint(c)
 	case r < 0.22:
 		e.doTransfer(c)
-	case r < 0.75:
+	case r < 0.70:
 		e.doSend(c, nil)
+	case r < 0.75:
+		// A burst on one cap and session: tests FIFO through the sequencer.
+		if h := e.pick(func(h *heldCap) bool { return !h.spent && !h.singleUse }); h != nil {
+			for i := 0; i < 3; i++ {
+				e.doSend(c, h)
+			}
+		}
 	case r < 0.85:
 		e.doRenew(c)
 	case r < 0.88:

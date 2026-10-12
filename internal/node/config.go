@@ -165,8 +165,11 @@ type MemberInfo struct {
 	WSURLs      []string  `json:"ws_urls,omitempty"`
 	DERP        *DERPInfo `json:"derp,omitempty"`
 	Region      string    `json:"region,omitempty"`
-	// Endpoints lists direct UDP endpoints for the mesh ("ip:port").
+	// Endpoints lists the mesh's direct endpoints ("ip:port"): UDP for
+	// the Tailscale mesh, TCP for the development mesh.
 	Endpoints []string `json:"endpoints,omitempty"`
+	// HomeDERP is the DERP region this Broker is reachable through.
+	HomeDERP int `json:"home_derp,omitempty"`
 }
 
 // Config configures a Node.

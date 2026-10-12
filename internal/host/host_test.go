@@ -3,6 +3,7 @@ package host_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http/httptest"
 	"strings"
@@ -25,7 +26,9 @@ type broker struct {
 	url string
 }
 
-func startCluster(t *testing.T, n int) []*broker {
+func startCluster(t *testing.T, n int) []*broker { return startClusterMesh(t, n, false) }
+
+func startClusterMesh(t *testing.T, n int, tailscale bool) []*broker {
 	t.Helper()
 	store := s3store.NewMem()
 	psk := make([]byte, 32)
@@ -36,9 +39,48 @@ func startCluster(t *testing.T, n int) []*broker {
 			t.Fatal(err)
 		}
 		id := ids.BrokerIDFromPub(k.Public[:])
-		m, err := mesh.NewTCP(id, psk, "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
+		var m host.Mesh
+		var endpoints []string
+		var ts *mesh.TS
+		var info struct {
+			sync.Mutex
+			disco string
+			h     *host.Host
+		}
+		if tailscale {
+			ts, err = mesh.NewTS(mesh.TSConfig{
+				NodePrivate: k.Private,
+				PSK:         psk,
+				OnUnknownPeer: func(id ids.BrokerID) {
+					info.Lock()
+					h := info.h
+					info.Unlock()
+					if h != nil {
+						h.UnknownPeer(id)
+					}
+				},
+				OnLocalInfo: func(disco string, _ []string, _ int) {
+					info.Lock()
+					info.disco = disco
+					h := info.h
+					info.Unlock()
+					if h != nil {
+						h.Do(func() { h.Node().UpdateMemberInfo(func(mi *node.MemberInfo) { mi.DiscoPub = disco }) })
+					}
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			m = ts
+			endpoints = []string{fmt.Sprintf("127.0.0.1:%d", ts.LocalPort())}
+		} else {
+			tm, err := mesh.NewTCP(id, psk, "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			m = tm
+			endpoints = []string{tm.Addr().String()}
 		}
 		b := &broker{}
 		b.srv = httptest.NewUnstartedServer(nil)
@@ -47,7 +89,7 @@ func startCluster(t *testing.T, n int) []*broker {
 		b.h = host.New(host.Options{
 			Node: node.Config{
 				NodePub:     k.Public[:],
-				Member:      node.MemberInfo{WSURLs: []string{b.url}, Endpoints: []string{m.Addr().String()}},
+				Member:      node.MemberInfo{WSURLs: []string{b.url}, Endpoints: endpoints, DiscoPub: info.disco},
 				PublicNames: []string{authority},
 				Tunables:    node.DefaultTunables(),
 				Limits:      node.DefaultLimits(),
@@ -56,13 +98,16 @@ func startCluster(t *testing.T, n int) []*broker {
 			Mesh:   m,
 			Logger: slog.New(slog.NewTextHandler(testWriter{t}, nil)).With("broker", i),
 		})
+		info.Lock()
+		info.h = b.h
+		info.Unlock()
 		b.srv.Config.Handler = b.h
 		b.srv.Start()
 		b.h.Start()
 		t.Cleanup(func() { b.h.Close(); b.srv.Close() })
 		out = append(out, b)
 	}
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(45 * time.Second)
 	for _, b := range out {
 		for {
 			var members int
@@ -115,25 +160,42 @@ func recv(t *testing.T, ch chan client.Delivery) client.Delivery {
 	return client.Delivery{}
 }
 
-func TestEndToEnd(t *testing.T) {
-	bs := startCluster(t, 3)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+func TestEndToEnd(t *testing.T) { testEndToEnd(t, startCluster(t, 3)) }
+
+func TestEndToEndTailscaleMesh(t *testing.T) {
+	if testing.Short() {
+		t.Skip("starts userspace WireGuard engines")
+	}
+	testEndToEnd(t, startClusterMesh(t, 3, true))
+}
+
+func testEndToEnd(t *testing.T, bs []*broker) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	svc, _, svcIn := dial(t, bs[0].url)
 	agent, agentKey, agentIn := dial(t, bs[1].url)
 
 	// The service mints a cap with a schema and a base, and transfers it to
 	// the agent's key (durable, out-of-band bootstrap).
-	capID, err := svc.Mint(ctx, client.MintOptions{
-		Schema:    json.RawMessage(`{"type":"object","required":["q"]}`),
-		Base:      json.RawMessage(`{"tenant":"t1"}`),
-		AutoReply: true,
-		Durable:   true,
-	})
-	if err != nil {
-		t.Fatal(err)
+	// Durable writes wait for 2 placement members; on a fresh mesh the
+	// first WireGuard handshakes can take a few seconds, so retry
+	// "unavailable" (it is retryable by definition).
+	var capID, granted string
+	var err error
+	for {
+		capID, err = svc.Mint(ctx, client.MintOptions{
+			Schema:    json.RawMessage(`{"type":"object","required":["q"]}`),
+			Base:      json.RawMessage(`{"tenant":"t1"}`),
+			AutoReply: true,
+			Durable:   true,
+		})
+		if err == nil {
+			granted, err = svc.Transfer(ctx, capID, agentKey.PublicString(), true)
+		}
+		if err == nil || !strings.Contains(err.Error(), "unavailable") || ctx.Err() != nil {
+			break
+		}
 	}
-	granted, err := svc.Transfer(ctx, capID, agentKey.PublicString(), true)
 	if err != nil {
 		t.Fatal(err)
 	}

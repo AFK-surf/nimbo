@@ -491,3 +491,45 @@ func sortedBrokerKeys[V any](m map[ids.BrokerID]V) []ids.BrokerID {
 func ms(d time.Duration) int64 { return d.Milliseconds() }
 
 func fromMs(v int64) time.Duration { return time.Duration(v) * time.Millisecond }
+
+// Snapshot is a point-in-time view for metrics and /debug.
+type Snapshot struct {
+	Stats
+	Members      int
+	Sessions     int
+	Records      int
+	Presence     int
+	QueuedOps    int
+	HeldMessages int
+	Suspects     int
+	FencedNow    bool
+	Draining     bool
+	Ready        bool
+	S3Offset     time.Duration
+	Incarnation  uint64
+}
+
+// Snapshot returns current counters and gauges.
+func (n *Node) Snapshot() Snapshot {
+	sus := 0
+	for id := range n.peers {
+		if n.isSuspect(id) {
+			sus++
+		}
+	}
+	return Snapshot{
+		Stats:        n.stats,
+		Members:      len(n.view.members),
+		Sessions:     n.SessionCount(),
+		Records:      len(n.recs),
+		Presence:     len(n.pres),
+		QueuedOps:    n.queuedOps(),
+		HeldMessages: n.HeldMessages(),
+		Suspects:     sus,
+		FencedNow:    n.fenced,
+		Draining:     n.draining,
+		Ready:        n.Ready(),
+		S3Offset:     n.s3Offset,
+		Incarnation:  n.inc,
+	}
+}

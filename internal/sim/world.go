@@ -34,6 +34,9 @@ type Config struct {
 	Limits     node.Limits
 	// Log receives a human-readable event log if set.
 	Log io.Writer
+	// Script, if set, schedules scripted events (see Crash, Partition and
+	// ExpectStable) instead of or in addition to random faults.
+	Script func(w *World)
 }
 
 // Faults sets the mean interval between injected faults of each kind; zero
@@ -88,11 +91,17 @@ type World struct {
 	s3      *S3
 	links   map[[2]int]*link
 
-	faultsOn  bool
-	quietAt   time.Duration
-	settledAt time.Duration
-	check     *Checker
-	nextEpIdx int
+	faultsOn bool
+	// Scripted stable window: from stableFrom (until stableUntil, if set)
+	// every send on a cap obtained before lossFreeBefore and used within
+	// 40s must succeed and be delivered.
+	stableFrom, stableUntil, lossFreeBefore time.Duration
+	goneTargets                             []*Endpoint
+	goneFrom                                time.Duration
+	quietAt                                 time.Duration
+	settledAt                               time.Duration
+	check                                   *Checker
+	nextEpIdx                               int
 }
 
 type event struct {
@@ -226,6 +235,7 @@ type Stats struct {
 	Sends, SendOK, Delivered, Bounced, Replies     int
 	Mints, Transfers, Renews, Attacks, AttacksOK   int
 	Expected, ExpectedOK, ExpectedDelivered        int
+	ExpectedGone, ReplicationChecked               int
 	Crashes, Partitions, S3Outages, Skews, Drains  int
 	Rotations, Churns, LinkResets                  int
 	Errors                                         map[string]int
@@ -253,6 +263,9 @@ func (r *Result) String() string {
 func (w *World) Run() *Result {
 	w.faultsOn = true
 	w.scheduleFaults()
+	if w.cfg.Script != nil {
+		w.cfg.Script(w)
+	}
 	w.quietAt = w.cfg.FaultPhase
 	w.At(w.quietAt, w.beginQuiet)
 	end := w.cfg.FaultPhase + w.cfg.Quiet
@@ -297,4 +310,117 @@ func (w *World) beginQuiet() {
 		}
 	}
 	w.resetAllLinks()
+}
+
+// --- scripting API (for targeted scenarios) ---
+
+// Crash crashes broker i at time t; it restarts after restartAfter (0: not
+// until the quiet phase).
+func (w *World) Crash(t time.Duration, i int, restartAfter time.Duration) {
+	w.At(t, func() {
+		b := w.brokers[i]
+		w.check.stats.Crashes++
+		b.crash()
+		if restartAfter > 0 {
+			w.After(restartAfter, b.restart)
+		}
+	})
+}
+
+// Partition isolates the given brokers from the rest between t and t+d.
+func (w *World) Partition(t, d time.Duration, brokers ...int) {
+	w.At(t, func() {
+		for _, i := range brokers {
+			w.brokers[i].group = 1
+		}
+		w.check.stats.Partitions++
+		w.logf("PARTITION %v", brokers)
+		w.resetAllLinks()
+	})
+	w.At(t+d, func() {
+		for _, b := range w.brokers {
+			b.group = 0
+		}
+		w.logf("partition healed")
+		w.resetAllLinks()
+	})
+}
+
+// BreakS3 makes broker i's S3 requests fail between t and t+d.
+func (w *World) BreakS3(t, d time.Duration, i int) {
+	w.At(t, func() { w.brokers[i].s3Broken = true; w.check.stats.S3Outages++ })
+	w.At(t+d, func() { w.brokers[i].s3Broken = false })
+}
+
+// ExpectStable declares that from `from` until `until` (0: the end) the
+// cluster must serve every send on a cap obtained before lossFreeBefore and
+// used in the last 40s, as long as its target is connected.
+func (w *World) ExpectStable(from, until, lossFreeBefore time.Duration) {
+	w.stableFrom, w.stableUntil, w.lossFreeBefore = from, until, lossFreeBefore
+}
+
+// RestartBroker crashes broker i at t and starts it again after down.
+func (w *World) RestartBroker(t time.Duration, i int, down time.Duration) {
+	w.Crash(t, i, down)
+}
+
+// CrashWithEndpoints crashes broker i at t for good (until the quiet
+// phase) and retires every endpoint connected only to it, so their
+// presence must turn into tombstones and, a minute later, "gone".
+func (w *World) CrashWithEndpoints(t time.Duration, i int) {
+	w.At(t, func() {
+		b := w.brokers[i]
+		for _, e := range w.eps {
+			if e.retired || len(e.conns) == 0 {
+				continue
+			}
+			only := true
+			for _, c := range e.conns {
+				if c.b != b {
+					only = false
+				}
+			}
+			if only {
+				w.logf("%s retires with %s", e.name, b)
+				e.retire()
+				w.goneTargets = append(w.goneTargets, e)
+			}
+		}
+		w.check.stats.Crashes++
+		b.crash()
+	})
+}
+
+// ExpectGone declares that from t on, sends to endpoints retired by
+// CrashWithEndpoints must fail with target_gone.
+func (w *World) ExpectGone(t time.Duration) { w.goneFrom = t }
+
+// CheckReplication schedules a check at t that every live cap (used in the
+// last 40s, obtained at least 5s earlier) is held by its whole placement
+// set.
+func (w *World) CheckReplication(t time.Duration) {
+	w.At(t, func() {
+		var ref *Broker
+		for _, b := range w.brokers {
+			if b.alive {
+				ref = b
+				break
+			}
+		}
+		n := 0
+		for _, e := range w.eps {
+			for _, h := range e.wallet {
+				if h.singleUse || h.spent || w.now-h.lastUse > 40*time.Second || w.now-h.obtained < 5*time.Second {
+					continue
+				}
+				n++
+				for _, m := range ref.node.PlacementSet(h.id) {
+					if _, ok := w.byID[m].node.HeldCap(h.id); !ok {
+						w.check.violate("cap %s (used %v ago) not on placement member %s", h.id, w.now-h.lastUse, w.byID[m])
+					}
+				}
+			}
+		}
+		w.check.stats.ReplicationChecked += n
+	})
 }

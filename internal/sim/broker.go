@@ -289,6 +289,9 @@ type Conn struct {
 	opened  time.Duration
 	readyAt time.Duration
 	epDone  bool // the endpoint has processed the close
+	// forge: this connection presents a handshake proof bound to another
+	// authority (a relayed challenge); the broker must reject it.
+	forge bool
 }
 
 func sortedSessions(m map[node.SessionID]*Conn) []node.SessionID {

@@ -303,6 +303,13 @@ func (n *Node) setView(nv *view) {
 		m := nv.members[id]
 		delete(n.departed, regKey(id, m.inc))
 		delete(n.fastJoinNeg, id)
+		if om := old.members[id]; om == nil || om.inc != m.inc {
+			// A new process: suspicion earned by its previous incarnation
+			// no longer applies, and handoff to it must not wait.
+			if p := n.peers[id]; p != nil {
+				p.suspectUntil, p.suspectFor = time.Time{}, 0
+			}
+		}
 	}
 	for _, id := range sortedBrokerKeys(n.peers) {
 		if nv.members[id] == nil {
@@ -487,4 +494,18 @@ func (n *Node) OnUnknownPeer(id ids.BrokerID) {
 	if n.started && !n.stopped && n.view.members[id] == nil {
 		n.fastJoin(id)
 	}
+}
+
+// UpdateMemberInfo changes this Broker's member object (for example the
+// mesh's disco key, endpoints and home DERP region) and publishes it at once:
+// a heartbeat PUT, and a Rejoin to every member.
+func (n *Node) UpdateMemberInfo(f func(*MemberInfo)) {
+	before := n.memberJSON()
+	f(&n.cfg.Member)
+	if !n.started || n.stopped || string(before) == string(n.memberJSON()) {
+		return
+	}
+	n.after(0, n.heartbeat)
+	n.applyMembers(n.copyMembers())
+	n.announce()
 }
