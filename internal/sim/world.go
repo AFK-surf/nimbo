@@ -18,6 +18,7 @@ import (
 
 	"github.com/afk-surf/nimbo/internal/ids"
 	"github.com/afk-surf/nimbo/internal/node"
+	"github.com/afk-surf/nimbo/internal/peerproto"
 )
 
 // Config describes one simulation run.
@@ -98,6 +99,7 @@ type World struct {
 	stableFrom, stableUntil, lossFreeBefore time.Duration
 	goneTargets                             []*Endpoint
 	goneFrom                                time.Duration
+	accountFrom                             time.Duration
 	quietAt                                 time.Duration
 	settledAt                               time.Duration
 	check                                   *Checker
@@ -202,6 +204,7 @@ func New(cfg Config) *World {
 	}
 	w.s3 = newS3(w)
 	w.check = newChecker(w)
+	w.ResetAccounting()
 	for i := 0; i < cfg.Brokers; i++ {
 		b := newBroker(w, i)
 		w.brokers = append(w.brokers, b)
@@ -228,6 +231,7 @@ type Result struct {
 	Steps      uint64
 	Violations []string
 	Stats      Stats
+	Window     time.Duration // accounting window
 }
 
 // Stats are workload counters.
@@ -240,6 +244,10 @@ type Stats struct {
 	Rotations, Churns, LinkResets                  int
 	Errors                                         map[string]int
 	BrokerDelivered, BrokerForwarded, BrokerHinted uint64
+	// Peer traffic by message kind (frames and bytes), and RCR ops by kind.
+	PeerFrames, PeerBytes, RCROps map[string]int
+	S3Ops                         map[string]int
+	Sessions                      int // sessions established
 }
 
 func (r *Result) String() string {
@@ -286,6 +294,7 @@ func (w *World) Run() *Result {
 	res := &Result{Seed: w.cfg.Seed, Trace: fmt.Sprintf("%x", w.trace.Sum(nil)), Steps: w.steps}
 	res.Violations = w.check.violations
 	res.Stats = w.check.stats
+	res.Window = w.AccountingWindow()
 	for _, b := range w.brokers {
 		if b.node != nil {
 			st := b.node.Stats()
@@ -372,27 +381,41 @@ func (w *World) RestartBroker(t time.Duration, i int, down time.Duration) {
 	w.Crash(t, i, down)
 }
 
-// CrashWithEndpoints crashes broker i at t for good (until the quiet
-// phase) and retires every endpoint connected only to it, so their
-// presence must turn into tombstones and, a minute later, "gone".
+// CrashWithEndpoints crashes a broker at t for good (until the quiet
+// phase) and retires every endpoint connected only to it, so their presence
+// must turn into tombstones and, a minute later, "gone". It picks the
+// broker with the most such endpoints, preferring broker i on ties.
 func (w *World) CrashWithEndpoints(t time.Duration, i int) {
 	w.At(t, func() {
-		b := w.brokers[i]
-		for _, e := range w.eps {
-			if e.retired || len(e.conns) == 0 {
-				continue
-			}
-			only := true
-			for _, c := range e.conns {
-				if c.b != b {
-					only = false
+		sole := func(b *Broker) []*Endpoint {
+			var out []*Endpoint
+			for _, e := range w.eps {
+				if e.retired || len(e.conns) == 0 {
+					continue
+				}
+				only := true
+				for _, c := range e.conns {
+					if c.b != b {
+						only = false
+					}
+				}
+				if only {
+					out = append(out, e)
 				}
 			}
-			if only {
-				w.logf("%s retires with %s", e.name, b)
-				e.retire()
-				w.goneTargets = append(w.goneTargets, e)
+			return out
+		}
+		b := w.brokers[i]
+		best := sole(b)
+		for _, o := range w.brokers {
+			if s := sole(o); len(s) > len(best) {
+				b, best = o, s
 			}
+		}
+		for _, e := range best {
+			w.logf("%s retires with %s", e.name, b)
+			e.retire()
+			w.goneTargets = append(w.goneTargets, e)
 		}
 		w.check.stats.Crashes++
 		b.crash()
@@ -432,3 +455,67 @@ func (w *World) CheckReplication(t time.Duration) {
 		w.check.stats.ReplicationChecked += n
 	})
 }
+
+// account records peer traffic by kind, for protocol cost measurements.
+func (w *World) account(e *peerproto.Envelope, n int) {
+	k := "other"
+	switch {
+	case e.Forward != nil:
+		k = "Forward"
+	case e.ForwardResult != nil:
+		k = "ForwardResult"
+	case e.RCR != nil:
+		k = "RCR"
+		for _, op := range e.RCR.Ops {
+			switch {
+			case op.Store != nil && op.Hint != nil:
+				w.check.stats.RCROps["Store(hinted)"]++
+			case op.Store != nil && op.Store.Kind == peerproto.KindBlob:
+				w.check.stats.RCROps["Store(blob)"]++
+			case op.Store != nil:
+				w.check.stats.RCROps["Store(cap)"]++
+			case op.Touch != nil:
+				w.check.stats.RCROps["Touch"]++
+			case op.Presence != nil:
+				w.check.stats.RCROps["Presence"]++
+			}
+		}
+	case e.RCRAck != nil:
+		k = "RCRAck"
+	case e.Get != nil:
+		k = "Get(" + map[peerproto.RecKind]string{peerproto.KindCap: "cap", peerproto.KindBlob: "blob", peerproto.KindPresence: "presence"}[e.Get.Kind] + ")"
+	case e.GetResult != nil:
+		k = "GetResult"
+	case e.Consume != nil:
+		k = "Consume"
+	case e.ConsumeResult != nil:
+		k = "ConsumeResult"
+	case e.Watch != nil:
+		k = "Watch"
+	case e.WatchResult != nil:
+		k = "WatchResult"
+	case e.Notify != nil:
+		k = "Notify"
+	case e.Rejoin != nil:
+		k = "Rejoin"
+	case e.RejoinAck != nil:
+		k = "RejoinAck"
+	case e.Bounce != nil:
+		k = "Bounce"
+	}
+	w.check.stats.PeerFrames[k]++
+	w.check.stats.PeerBytes[k] += n
+}
+
+// ResetAccounting zeroes the workload and traffic counters (for example
+// after warm-up), keeping invariant state.
+func (w *World) ResetAccounting() {
+	st := &w.check.stats
+	errs := st.Errors
+	*st = Stats{Errors: errs}
+	st.PeerFrames, st.PeerBytes, st.RCROps, st.S3Ops = map[string]int{}, map[string]int{}, map[string]int{}, map[string]int{}
+	w.accountFrom = w.now
+}
+
+// AccountingWindow is how long the counters have been running.
+func (w *World) AccountingWindow() time.Duration { return w.now - w.accountFrom }

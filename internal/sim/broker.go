@@ -244,6 +244,7 @@ func (w *World) latency() time.Duration {
 func (w *World) sendPeer(src *Broker, to ids.BrokerID, env *peerproto.Envelope) {
 	dst := w.byID[to]
 	data := peerproto.Marshal(env)
+	w.account(env, len(data))
 	srcGen := src.gen
 	if dst == nil || !w.connected(src, dst) {
 		w.After(w.dur(5*time.Millisecond, 300*time.Millisecond), func() {

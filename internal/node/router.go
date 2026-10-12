@@ -60,7 +60,6 @@ type holdQueue struct {
 	msgs         []*message
 	nextBackstop time.Time
 	watchUntil   time.Time
-	flushing     bool
 }
 
 func (n *Node) actSend(s *session, in *wire.In) {
@@ -650,7 +649,7 @@ func (n *Node) onPresenceHint(k ids.Key, s presence.Set) {
 
 func (n *Node) flushHeldLocal(k ids.Key) {
 	hq := n.held[k]
-	if hq == nil || hq.flushing {
+	if hq == nil {
 		return
 	}
 	msgs := hq.msgs
@@ -665,52 +664,86 @@ func (n *Node) flushHeldLocal(k ids.Key) {
 	}
 }
 
-// flushHeld forwards held messages in order, one at a time.
+// flushHeld forwards all held messages at once, in order, each to the first
+// non-suspect candidate. Forwards to one Broker share an ordered link, and
+// the queue is released before any reply, so later messages queue behind
+// these on the link instead of overtaking them. A message that is not taken
+// is held again.
 func (n *Node) flushHeld(hq *holdQueue, owners []ids.BrokerID) {
-	if hq.flushing {
+	k := hq.key
+	if n.held[k] != hq {
 		return
 	}
-	hq.flushing = true
-	var next func()
-	next = func() {
-		if n.held[hq.key] != hq {
-			return
+	if len(n.byKey[k]) > 0 {
+		n.flushHeldLocal(k)
+		return
+	}
+	// Messages with no reachable candidate stay held, in order, in the same
+	// queue (keeping its watch); the rest go out now.
+	type out struct {
+		m  *message
+		to ids.BrokerID
+	}
+	var send []out
+	keep := hq.msgs[:0]
+	for _, m := range hq.msgs {
+		var to ids.BrokerID
+		for _, c := range n.candidates(m, owners) {
+			if !n.isSuspect(c) {
+				to = c
+				break
+			}
 		}
-		if len(hq.msgs) == 0 {
-			hq.flushing = false
-			delete(n.held, hq.key)
-			return
+		if to.IsZero() {
+			keep = append(keep, m)
+			continue
 		}
-		if len(n.byKey[hq.key]) > 0 {
-			hq.flushing = false
-			n.flushHeldLocal(hq.key)
-			return
-		}
-		m := hq.msgs[0]
+		send = append(send, out{m, to})
+	}
+	hq.msgs = keep
+	if len(hq.msgs) == 0 {
+		delete(n.held, k)
+	}
+	for _, o := range send {
+		m, to := o.m, o.to
 		m.hop++
-		n.tryForward(m, n.candidates(m, owners), func() {
-			hq.flushing = false // nobody took it; keep holding
-		}, func(retry bool) {
-			if retry {
-				hq.flushing = false // not_here: keep holding, backstop re-looks-up
-				return
+		n.call(to, n.forwardEnv(m), func(resp *peerproto.Envelope, err error) {
+			switch {
+			case err == errNotSent:
+				n.hold(m)
+			case err != nil || resp.ForwardResult == nil:
+				n.stats.Dropped++ // written but unanswered: at most once
+			case resp.ForwardResult.Code == peerproto.FwdAccepted:
+				n.stats.Forwarded++
+			case resp.ForwardResult.Code == peerproto.FwdNotHere:
+				delete(n.locCache, k)
+				m.reroutes++
+				if m.reroutes > n.tun.MaxReroutes {
+					n.bounce(m, wire.BounceUnavailable)
+					return
+				}
+				n.hold(m)
+			default:
+				n.bounce(m, resp.ForwardResult.Reason)
 			}
-			if len(hq.msgs) > 0 && hq.msgs[0] == m {
-				hq.msgs = hq.msgs[1:]
-			}
-			next()
 		})
 	}
-	next()
+}
+
+// kickHeld re-evaluates every held message at once, for example when a
+// suspected Broker answers again.
+func (n *Node) kickHeld() {
+	now := n.now()
+	for _, hq := range n.held {
+		hq.nextBackstop = now
+	}
+	n.after(0, n.sweepHeld)
 }
 
 func (n *Node) sweepHeld() {
 	now := n.now()
 	for _, k := range sortedKeys(n.held) {
 		hq := n.held[k]
-		if hq.flushing {
-			continue
-		}
 		keep := hq.msgs[:0]
 		for _, m := range hq.msgs {
 			if now.After(m.deadline) {
@@ -736,7 +769,7 @@ func (n *Node) sweepHeld() {
 		}
 		hq.nextBackstop = now.Add(n.tun.HoldBackstop)
 		n.lookupPresence(k, func(s presence.Set) {
-			if n.held[k] != hq || hq.flushing {
+			if n.held[k] != hq {
 				return
 			}
 			st, owners := n.classify(s)

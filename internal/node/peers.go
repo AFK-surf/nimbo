@@ -34,6 +34,7 @@ type peer struct {
 	order        []opKey
 	inflight     int
 	flushSched   bool
+	probing      bool
 }
 
 func (n *Node) peer(id ids.BrokerID) *peer {
@@ -81,6 +82,7 @@ func (n *Node) peerOK(id ids.BrokerID) {
 	}
 	if was {
 		n.repushPresenceTo(id)
+		n.kickHeld()
 	}
 }
 
@@ -292,9 +294,20 @@ func (n *Node) buildOp(op *repOp) (peerproto.Op, bool) {
 	return w, true
 }
 
+// probeGet is a lookup nobody stores; any answer proves the peer is back.
+var probeGet = peerproto.Get{Kind: peerproto.KindCap, ID: make([]byte, 16)}
+
 func (n *Node) sweepPeers() {
 	for _, id := range sortedBrokerKeys(n.peers) {
 		p := n.peers[id]
+		// Probe suspected peers so that suspicion ends as soon as they
+		// answer, not only when its timer runs out: messages to targets
+		// connected only there are held meanwhile.
+		if n.isSuspect(id) && !p.probing && n.view.members[id] != nil {
+			p.probing = true
+			g := probeGet
+			n.call(id, &peerproto.Envelope{Get: &g}, func(*peerproto.Envelope, error) { p.probing = false })
+		}
 		if len(p.q) > 0 && p.inflight == 0 && !n.isSuspect(id) {
 			n.flush(p)
 		}

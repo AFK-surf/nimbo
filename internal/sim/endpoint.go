@@ -170,6 +170,7 @@ func (e *Endpoint) onFrame(c *Conn, data []byte) {
 		proof := wire.Proof(ss, nonce, authority, e.key[:], eph)
 		e.send(c, wire.In{Op: "hello", Key: e.key.String(), Authority: authority, Proof: ids.B32.EncodeToString(proof), Client: "sim/1", MaxMessageBytes: e.maxMsg})
 	case "welcome":
+		e.w.check.stats.Sessions++
 		if c.forge {
 			e.w.check.violate("%s: forged handshake accepted by %s", e.name, c.b)
 		}

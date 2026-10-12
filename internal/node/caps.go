@@ -294,10 +294,17 @@ func (n *Node) newCapID() ids.CapID {
 // singleUseID draws IDs until this Broker is the nearest live Broker to
 // SHA-256(ID) (design §8.3).
 func (n *Node) singleUseID() (ids.CapID, bool) {
-	for i := 0; i < 8192; i++ {
-		id := n.newCapID()
-		if near := n.view.nearestAll(id.PlacementKey(), 1); len(near) == 1 && near[0] == n.id {
-			return id, true
+	// Expected tries: about the number of Brokers. Draw randomness in
+	// batches and decide most candidates with the prefix table.
+	var buf [64 * 16]byte
+	for batch := 0; batch < 128; batch++ {
+		ids.RandBytes(n.env.Rand(), buf[:])
+		for i := 0; i < 64; i++ {
+			var id ids.CapID
+			copy(id[:], buf[i*16:])
+			if near, ok := n.view.idx.NearestOwnerFast(id.PlacementKey()); ok && near == n.id {
+				return id, true
+			}
 		}
 	}
 	return ids.CapID{}, false
