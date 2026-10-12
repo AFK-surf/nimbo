@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Nightly: a larger deterministic-simulation sweep over fresh seeds.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: "Number of simulation seeds"
+        default: "1000"
+      seed:
+        description: "First seed (default: derived from the run number)"
+        default: ""
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then echo "Files need gofmt:"; echo "$out"; exit 1; fi
+      - name: go vet
+        run: go vet ./...
+      - name: go.mod is tidy
+        run: go mod tidy -diff
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Unit, end-to-end (TCP mesh) and short simulation tests, with the race detector
+        run: go test -race -short -count=1 ./...
+      - name: Build binaries
+        run: go build ./cmd/...
+
+  mesh:
+    # End to end over userspace WireGuard + netstack (no root needed).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Tailscale-mesh tests
+        run: go test -race -count=1 -timeout 10m ./internal/mesh ./internal/host
+
+  dst:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Scripted scenarios and determinism
+        run: go test -count=1 -timeout 30m ./internal/sim
+      - name: Random fault schedules
+        env:
+          EVENT: ${{ github.event_name }}
+          SEEDS_INPUT: ${{ github.event.inputs.seeds }}
+          SEED_INPUT: ${{ github.event.inputs.seed }}
+        run: |
+          # Each run explores new seeds; a failing seed replays exactly with
+          #   go run ./cmd/nimbo-sim -seed <N> -n 1 -v
+          n=200
+          if [ "$EVENT" = "schedule" ]; then n=1000; fi
+          if [ -n "$SEEDS_INPUT" ]; then n=$SEEDS_INPUT; fi
+          seed=$(( GITHUB_RUN_NUMBER * 100000 + GITHUB_RUN_ATTEMPT * 10000 ))
+          if [ -n "$SEED_INPUT" ]; then seed=$SEED_INPUT; fi
+          echo "seeds $seed .. $((seed + n - 1))"
+          go build -o nimbo-sim ./cmd/nimbo-sim
+          ./nimbo-sim -seed "$seed" -n "$n"
+      - name: Harsh fault schedules (3x fault rate, 8 brokers)
+        if: github.event_name != 'pull_request'
+        run: |
+          seed=$(( GITHUB_RUN_NUMBER * 100000 + 50000 ))
+          ./nimbo-sim -seed "$seed" -n 200 -fault-scale 3 -brokers 8 -endpoints 30
