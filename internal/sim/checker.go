@@ -270,6 +270,7 @@ func (c *Checker) delivered(e *Endpoint, conn *Conn, out *wire.Out) {
 		c.violate("message %s: reply cap present=%v, auto_reply=%v", nonce, out.Reply != "", rec.cap.autoReply)
 	}
 	if rec.cap.singleUse {
+		c.stats.Replies++
 		c.replyDelivered[rec.cap.replyOf]++
 		if c.replyDelivered[rec.cap.replyOf] > 1 {
 			c.violate("reply lineage of %s delivered %d times", rec.cap.replyOf, c.replyDelivered[rec.cap.replyOf])

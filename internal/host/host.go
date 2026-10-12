@@ -232,6 +232,16 @@ func (e *env) S3(req node.S3Request, done func(node.S3Response)) {
 
 func (e *env) MembersChanged(ms []node.Member) {
 	h := e.h()
+	live := map[ids.BrokerID]bool{}
+	for _, m := range ms {
+		live[m.ID] = true
+	}
+	for k, l := range h.links {
+		if !live[k.to] {
+			l.stop()
+			delete(h.links, k)
+		}
+	}
 	cp := append([]node.Member(nil), ms...)
 	h.members.Store(&cp)
 	go h.opts.Mesh.SetPeers(cp)

@@ -348,8 +348,16 @@ func (w *World) Partition(t, d time.Duration, brokers ...int) {
 
 // BreakS3 makes broker i's S3 requests fail between t and t+d.
 func (w *World) BreakS3(t, d time.Duration, i int) {
-	w.At(t, func() { w.brokers[i].s3Broken = true; w.check.stats.S3Outages++ })
-	w.At(t+d, func() { w.brokers[i].s3Broken = false })
+	b := w.brokers[i]
+	w.At(t, func() { b.s3Broken = true; w.check.stats.S3Outages++ })
+	if d > 55*time.Second {
+		w.At(t+55*time.Second, func() {
+			if b.alive && b.s3Broken && b.node.Ready() {
+				w.check.violate("%s not fenced 55s into an S3 outage", b)
+			}
+		})
+	}
+	w.At(t+d, func() { b.s3Broken = false })
 }
 
 // ExpectStable declares that from `from` until `until` (0: the end) the

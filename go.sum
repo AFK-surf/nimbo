@@ -16,6 +16,8 @@ github.com/aws/aws-sdk-go-v2/credentials v1.20.9 h1:SNO55PnWhaDafsOcv16lCA0kdoFM
 github.com/aws/aws-sdk-go-v2/credentials v1.20.9/go.mod h1:+2reOTRtdD3VSBqpRDNwrZIYy8yMCYa7oK3WKTJ/I1I=
 github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.20.3 h1:gr3b87OLB29jymWPzp/CAyXwQRJVE+sC4Wm0qBIKHsk=
 github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.20.3/go.mod h1:BRjf4L/Yx2hY54o+ZibPbLJyMMeSwqYQXwcJfqW66a8=
+github.com/aws/aws-sdk-go-v2/feature/s3/manager v1.23.4 h1:XsHB4FG3NlMEBuF9Uy0P8aAlB7XsnCGsifjjmqfRkHc=
+github.com/aws/aws-sdk-go-v2/feature/s3/manager v1.23.4/go.mod h1:4FHwC6RC66L1Z/OaTl+4aMMbcgDwwbVJk0Sl8s+Jdfg=
 github.com/aws/aws-sdk-go-v2/internal/configsources v1.5.6 h1:CqL8NN3p4I0JTwwV5MEoatIl4Y2amZ2X9dRD+0hbRL0=
 github.com/aws/aws-sdk-go-v2/internal/configsources v1.5.6/go.mod h1:exdJ32hMqXl0Wyo6NwqEC5yIhtua3+PDaKE8P29m4qE=
 github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.8.6 h1:FpBq24TG6WVSObTNhQOv7Q0088rounUUlwn3zlNItkM=
@@ -50,6 +52,8 @@ github.com/benbjohnson/immutable v0.4.3 h1:GYHcksoJ9K6HyAUpGxwZURrbTkXA0Dh4otXGq
 github.com/benbjohnson/immutable v0.4.3/go.mod h1:qJIKKSmdqz1tVzNtst1DZzvaqOU1onk1rc03IeM3Owk=
 github.com/bradfitz/reco v0.0.0-20260929154613-b883fbd17e3f h1:jdXGSp5Ge5/kzikuxGOw9+6HSStUjkNBJZjGNtpItek=
 github.com/bradfitz/reco v0.0.0-20260929154613-b883fbd17e3f/go.mod h1:oiCPXxBoDKSkb/RGEZwAZk8y/fwDlQ1vYlBbNRxPysw=
+github.com/cevatbarisyilmaz/ara v0.0.4 h1:SGH10hXpBJhhTlObuZzTuFn1rrdmjQImITXnZVPSodc=
+github.com/cevatbarisyilmaz/ara v0.0.4/go.mod h1:BfFOxnUd6Mj6xmcvRxHN3Sr21Z1T3U2MYkYOmoQe4Ts=
 github.com/cilium/ebpf v0.22.0 h1:v2ktp0roffpMOj2MMf3idtCQZOsAoC4BJbAJN+ke2bY=
 github.com/cilium/ebpf v0.22.0/go.mod h1:CDzZbe2hC5JjlDC+CY3KFCzlYwN4gbxppYM+Z10bQt4=
 github.com/coder/websocket v1.8.15 h1:6B2JPeOGlpff2Uz6vOEH1Vzpi0iUz20A+lPVhPHtNUA=
@@ -112,6 +116,8 @@ github.com/insomniacslk/dhcp v0.0.0-20260901064844-234b97448fae h1:nXGg65fXsylSU
 github.com/insomniacslk/dhcp v0.0.0-20260901064844-234b97448fae/go.mod h1:tGfUTcnFYGYvVNCaZZhwlJySU/fQQxh9TmpsFzWXnnY=
 github.com/jellydator/ttlcache/v3 v3.4.1 h1:bOdXmXiycyK6E6Qjyuj5vl+/vU3SCOoDs8a86NbHjAQ=
 github.com/jellydator/ttlcache/v3 v3.4.1/go.mod h1:j7LO12PNghFg5+0v9budMAT4rDK4JY969jb9vOdOBBk=
+github.com/johannesboyne/gofakes3 v1.2.0 h1:I9VEzPWvvAUAGzDlhYFoZjF0AXMlkcEyZlmBwiI6Oms=
+github.com/johannesboyne/gofakes3 v1.2.0/go.mod h1:UHhRZRod9rENGFrUWTYnQHZqlNgSmjOq8DaD/ATQYRM=
 github.com/jsimonetti/rtnetlink v1.4.2 h1:Df9w9TZ3npHTyDn0Ev9e1uzmN2odmXd0QX+J5GTEn90=
 github.com/jsimonetti/rtnetlink v1.4.2/go.mod h1:92s6LJdE+1iOrw+F2/RO7LYI2Qd8pPpFNNUYW06gcoM=
 github.com/kamstrup/intmap v0.5.2 h1:qnwBm1mh4XAnW9W9Ue9tZtTff8pS6+s6iKF6JRIV2Dk=
@@ -148,10 +154,14 @@ github.com/prometheus/common v0.71.0 h1:9KDAKb7Mj3HEVKyFCK6Dc/HIwlBzZIN2l7/lrHl3
 github.com/prometheus/common v0.71.0/go.mod h1:CLJ5H8TEsGX8bl31BdMkfhIZ+QmZ9tBPPotUxUbfcmk=
 github.com/rogpeppe/go-internal v1.16.0 h1:O9DK+vNMDVGLr2BeZqmpLeMjiMNkuXfcqntWbZV6S5g=
 github.com/rogpeppe/go-internal v1.16.0/go.mod h1:DrUVZyrJU+txYW5/1kwtXQSMFio52ZOxX7yM1VHvnxs=
+github.com/ryszard/goskiplist v0.0.0-20150312221310-2dfbae5fcf46 h1:GHRpF1pTW19a8tTFrMLUcfWwyC0pnifVo2ClaLq+hP8=
+github.com/ryszard/goskiplist v0.0.0-20150312221310-2dfbae5fcf46/go.mod h1:uAQ5PCi+MFsC7HjREoAz1BU+Mq60+05gifQSsHSDG/8=
 github.com/safchain/ethtool v0.7.0 h1:rlJzfDetsVvT61uz8x1YIcFn12akMfuPulHtZjtb7Is=
 github.com/safchain/ethtool v0.7.0/go.mod h1:MenQKEjXdfkjD3mp2QdCk8B/hwvkrlOTm/FD4gTpFxQ=
 github.com/santhosh-tekuri/jsonschema/v6 v6.0.3 h1:1EYB5IzjZawrrnELUi78f9fPu57HuXjmddZPjrls/28=
 github.com/santhosh-tekuri/jsonschema/v6 v6.0.3/go.mod h1:JXeL+ps8p7/KNMjDQk3TCwPpBy0wYklyWTfbkIzdIFU=
+github.com/spf13/afero v1.15.0 h1:b/YBCLWAJdFWJTN9cLhiXXcD7mzKn9Dm86dNnfyQw1I=
+github.com/spf13/afero v1.15.0/go.mod h1:NC2ByUVxtQs4b3sIUphxK0NioZnmxgyCrfzeuq8lxMg=
 github.com/stretchr/testify v1.12.1 h1:EuwCh5fleGS7H32xRwO3wRGT7DxrDhLAT6FF8MpWDWE=
 github.com/stretchr/testify v1.12.1/go.mod h1:MDEgiDPPsNp5cuIrHPPCyornHKgEVbtFUmoNlxoYthg=
 github.com/studio-b12/gowebdav v0.13.0 h1:OcwSg6IQHOFNdYHn3bPOHwSE8looG8N56Y5xTT1asqQ=
@@ -178,6 +188,10 @@ github.com/vishvananda/netns v0.0.5 h1:DfiHV+j8bA32MFM7bfEunvT8IAqQ/NzSJHtcmW5zd
 github.com/vishvananda/netns v0.0.5/go.mod h1:SpkAiCQRtJ6TvvxPnOSyH3BMl6unz3xZlaprSwhNNJM=
 github.com/x448/float16 v0.8.4 h1:qLwI1I70+NjRFUR3zs1JPUCgaCXSh3SW62uAKT1mSBM=
 github.com/x448/float16 v0.8.4/go.mod h1:14CWIYCyZA/cWjXOioeEpHeN/83MdbZDRQHoFcYsOfg=
+go.etcd.io/bbolt v1.5.0 h1:S7GAl7Fxv12yohbwFfIbQCGDWbQbtDGPET4P/bD4lxU=
+go.etcd.io/bbolt v1.5.0/go.mod h1:mkltfYE5aUHQxUct9N9V+Kp7aSjFqjgrhcXIS70Lrdk=
+go.shabbyrobe.org/gocovmerge v0.0.0-20230507111327-fa4f82cfbf4d h1:Ns9kd1Rwzw7t0BR8XMphenji4SmIoNZPn8zhYmaVKP8=
+go.shabbyrobe.org/gocovmerge v0.0.0-20230507111327-fa4f82cfbf4d/go.mod h1:92Uoe3l++MlthCm+koNi0tcUCX3anayogF0Pa/sp24k=
 go.yaml.in/yaml/v3 v3.0.5 h1:N6y/pJk8buWs9NY5ERU2HSMfm+IuD/OtfdAnq6kESPw=
 go.yaml.in/yaml/v3 v3.0.5/go.mod h1:HVTZu1O7/Vkt2N+BFy8Zza+lnLsABggaTM2ZpNIGuKg=
 go4.org/mem v0.0.0-20240501181205-ae6ca9944745 h1:Tl++JLUCe4sxGu8cTpDzRLd3tN7US4hOxG5YpKCzkek=
@@ -212,6 +226,8 @@ golang.zx2c4.com/wireguard/windows v1.0.1 h1:eOxiDVbywPC+ZQqvdCK7x+ZwWXKbYv50TtH
 golang.zx2c4.com/wireguard/windows v1.0.1/go.mod h1:+fbT3FFdX4zzYDLwJh5+HPEcNN/3HyNdzhNSVsQM+zs=
 google.golang.org/protobuf v1.36.12 h1:pJOKDDOyeXErUroCihFAd5LQuwXBSpVnKGrj5o/fwxc=
 google.golang.org/protobuf v1.36.12/go.mod h1:HTf+CrKn2C3g5S8VImy6tdcUvCska2kB7j23XfzDpco=
+gopkg.in/mgo.v2 v2.0.0-20180705113604-9856a29383ce h1:xcEWjVhvbDy+nHP67nPDDpbYrY+ILlfndk4bRioVHaU=
+gopkg.in/mgo.v2 v2.0.0-20180705113604-9856a29383ce/go.mod h1:yeKp02qBN3iKW1OzL3MGk2IdtZzaj7SFntXj72NppTA=
 gvisor.dev/gvisor v0.0.0-20260915211658-a6f909f08a72 h1:EytKYr5WrVs+Aah/0xDO8ZAZZzS/iTEVC8ln4ipDbL0=
 gvisor.dev/gvisor v0.0.0-20260915211658-a6f909f08a72/go.mod h1:8aLQqUBHDH8fY5y60lzmwDpMMbQCcT3EBfoSwhfaGCY=
 howett.net/plist v1.0.0 h1:7CrbWYbPPO/PyNy38b2EB/+gYbjCe2DXBxgtOOZbSQM=

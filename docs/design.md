@@ -2,7 +2,7 @@
 
 Nimbo is a distributed, capability-based messaging fabric for AI agents, isolated runtimes and external devices. This document refines the concept notes into a design that can be built. It is written in Go and ships as one binary, `nimbod`.
 
-Status: draft for review, revision 5. It incorporates the fixes from the [design review](review.md). The decisions taken with the project owner are listed in [§13](#13-decision-log). Defaults chosen without the owner, which are open to change, are in [§14](#14-defaults-open-to-change).
+Status: revision 6, implemented in this repository. Revision 5 incorporated the fixes from the [design review](review.md). Revision 6 records what building and simulation-testing it changed; those changes are listed in [§16](#16-changes-from-implementation-and-dst-revision-6) and marked **(rev 6)** where they apply. The decisions taken with the project owner are listed in [§13](#13-decision-log). Defaults chosen without the owner, which are open to change, are in [§14](#14-defaults-open-to-change).
 
 ---
 
@@ -92,15 +92,17 @@ Bucket layout under a configured prefix `s3://<bucket>/<prefix>/`:
 - **Heartbeat.** Each Broker re-PUTs its member object every `member_heartbeat` (15s). The content holds no timestamps, so the ETag stays the same and only `LastModified` moves.
 - **Discovery.** Each Broker LISTs `members/` every `member_poll` (30s). It GETs an object only when its ETag changed. A member is dead when `S3 time − LastModified > member_ttl` (60s).
   - **Freeze on failure:** if a LIST fails, the Broker keeps its last membership view and expires **nobody** until a LIST succeeds.
-- **Self-fencing.** If a Broker's own last successful heartbeat is older than `member_ttl − 15s` (S3 time), or its clock is out of bounds:
+- **Self-fencing.** If a Broker's own last successful heartbeat is older than `member_ttl − 15s` (S3 time), or its clock is out of bounds (`|s3_offset| > max_skew`, using the median of the last 5 offset samples **(rev 6)**):
   - it sends `closing` with a jittered `retry_after_ms` to all its sessions;
   - it stops accepting new sessions;
   - it stops acting as a write target.
 
-  Its endpoints move to healthy Brokers before peers declare it dead, so it never becomes a black hole. Fencing lifts once heartbeats succeed and the clock is within bounds again.
+  Its endpoints move to healthy Brokers before peers declare it dead, so it never becomes a black hole. Fencing lifts once heartbeats succeed and the clock is within bounds again. **(rev 6)** On unfencing, the Broker takes a **new incarnation** and announces it (heartbeat PUT and `Rejoin`), exactly as after a restart: peers may have declared it dead meanwhile and tombstoned its registers, and nothing written under the old incarnation may shadow new state.
 - **Fast join.** When the mesh sees a handshake from an unknown node key, the Broker GETs `members/<SHA-256(key)>.json`. If the object exists and is fresh, the peer is added at once; existence in S3 is the admission check.
   - **Abuse limits:** misses are cached negatively for 60s, and fast-join GETs are globally rate limited (10/s per Broker). Random handshake attempts therefore cannot amplify S3 load.
 - **Rejoin announce.** On start, after writing its member object, a Broker sends `Rejoin{incarnation}` to every live member. This updates their views at once and triggers handoff to it (§7.4).
+  - **(rev 6)** An incarnation learned from a `Rejoin` (or from any peer frame, which carries the sender's incarnation) is kept until an S3 member object **newer** than that moment says otherwise; a LIST/GET that still returns the old object must not roll the view back.
+  - **(rev 6)** A peer seen with a new incarnation loses any local suspicion at once, so handoff to the restarted process is not held back.
 - **Graceful leave**, in this order:
   1. PUT the member object with `draining: true` and announce it. Peers stop choosing this Broker as a write target but keep querying it.
   2. Send `closing` to sessions.
@@ -132,7 +134,7 @@ This follows tailcat's approach: Tailscale's open-source data plane used directl
   - Suspect peers are skipped as write targets (§7.2) and queried last on reads.
   - Suspicion never changes membership; S3 stays authoritative. It just gets traffic off a crashed Broker within seconds instead of the 60–90s S3 detection takes.
   - When a link to a suspect peer recovers, its retry queues are flushed (§7.2).
-- **Framing.** Length-prefixed protobuf frames (`internal/peerproto`) with a version byte in the stream preamble. Small RCR writes to the same Broker are coalesced into one frame. All durations on the wire are **remaining milliseconds**, never absolute times. RPCs:
+- **Framing.** Length-prefixed frames (`internal/peerproto`) with the preamble `NMB` + version byte. **(rev 6)** Frames are CBOR maps with integer keys (the library already used for cap records) instead of protobuf, which avoids a code generator; the schema is the Go structs in `peerproto`. Small RCR writes to the same Broker are coalesced into one frame. All durations on the wire are **remaining milliseconds**, never absolute times. RPCs:
   - `Forward` / `ForwardResult`: messages (§9);
   - `Store`, `Get`, `Touch`, `Consume`: records of each kind (§7, §8);
   - `Watch` / `Notify`: presence changes (§9.4);
@@ -181,7 +183,7 @@ Requests carry a client-chosen `rid`. Each gets exactly one `result`: `{"op":"re
 | `renew` (**RenewCap**) | `caps` (array of cap IDs) | per-cap `{ok, ttl_ms}` or an error. The IDs do not change. |
 | `inspect` | `cap` | the record (with schema and base resolved) and remaining TTL (debugging and SDK convenience) |
 
-`durable: true` makes the call wait until at least one remote member of the placement set has acknowledged the new record. Without it the record can be lost if the issuing Broker crashes within milliseconds. Use it in bootstrap flows where the ID is handed out of band.
+`durable: true` makes the call wait until **two members of the placement set** (or all of them, if fewer) hold the new record, counting the issuer if it is one. Without it the record can be lost if the issuing Broker crashes within milliseconds. Use it in bootstrap flows where the ID is handed out of band. **(rev 6)** Revision 5 waited for one remote acknowledgement; with an issuer outside the placement set, two members could then still answer "not found" and a lookup from another Broker could return `invalid_cap` for a valid cap.
 
 | Op (B → E) | Fields |
 |---|---|
@@ -246,6 +248,8 @@ The issuer's pinned copy keeps uses on the creating Broker local, with no networ
    - **found:** use the merged record;
    - **not found:** at least 2 members of the current placement set answered "not found", and none is suspect. Only this produces `invalid_cap` or treats presence as empty;
    - **anything else:** retry with backoff for up to `lookup_wait` (1s), which covers a record whose `Store` is still in flight. If that also fails, the result is `unavailable`, which is retryable.
+   - **(rev 6)** A positive not-found is also re-checked until `lookup_wait` has passed before it becomes `invalid_cap`: an endpoint with sessions on two Brokers may use a just-minted cap on the second one before the `Store` lands. The unknown-ID lookup quota (§6.4) bounds the cost.
+   - Suspect Brokers are left out of the fan-out; answers are merged as they arrive and a found, unexpired record ends the lookup early.
 
 Blobs are immutable, so a cached blob is always valid for its content. But the cache records the blob's TTL, so the "already live in the Cluster" check (§8.3) never trusts an expired cache entry. Cached cap records can hold a stale TTL, and cached presence can be stale. §8.4 and §9.2 say when each is re-read.
 
@@ -265,11 +269,13 @@ Blobs are immutable, so a cached blob is always valid for its content. But the c
 
 ### 7.5 Expiry (sliding)
 
-Cap and blob records carry a TTL and use the same sliding rule:
+Cap and blob records carry a TTL and use the same sliding rule. **(rev 6)** Local deadlines are kept on the **monotonic** clock; the wall clock is only compared with S3 time (§4). A wall-clock step therefore cannot stretch or shrink a TTL, which the simulator found when it stepped clocks.
 
 - creating a record sets `ttl = cap_ttl` (60s);
 - a Broker that sees a use resets its local deadline to `now + cap_ttl`. Once it has extended that by at least `touch_threshold` (10s) since its last touch, it sends `Touch{key, ttl_ms}` to the placement set, acknowledged and coalesced;
+- a record is **accepted** while `now ≤ deadline + grace`;
 - holders keep a record until `deadline + grace + touch_threshold` (25s past their deadline). A holder's deadline can lag the true one by up to `touch_threshold`. The extra margin means holders never drop a record that some Broker would still accept (review H2b).
+- **(rev 6)** Every operation that creates a cap from another (transfer, including a single-use transfer that consumes the original, and carried-cap translation at ingress) counts as a use of the schema and base blobs, so a new cap never outlives its blobs.
 
 This gives **soft expiry**: a record is accepted until 60–75s after its last use, as seen across the Cluster. A record used only within its first 10s sends no touches. Presence registers follow their own retention (§9.1).
 
@@ -373,6 +379,7 @@ Presence answers "which Brokers is this Endpoint connected to right now?"
   - when `sessions` is empty, `absent_ttl` is the time since the last one closed, sent as remaining milliseconds.
 
   The owner always sends the **full** register, and holders keep the highest `seq`. This is a per-owner last-writer-wins CRDT: delayed, duplicated or handed-off writes cannot resurrect a closed session.
+- **Merge order (rev 6).** Registers are ordered by `seq` first; at equal `seq` a tombstone wins; among tombstones the later absence wins. So an owner can always override a holder's tombstone with a newer write (and it bumps `seq` on every full re-push), while a holder that knows the owner is dead re-tombstones any write it receives for that (owner, incarnation). Revision 5 let tombstones win outright, which left an endpoint looking absent, then `gone`, when a holder tombstoned a live owner's register during a view change.
 - **Validity.** A register with sessions counts only while its owner is a live member with that incarnation.
 - **Pruning.** When an owner is declared dead or changes incarnation, holders turn its registers into **tombstones** with `absent since = prune time`. The endpoint therefore gets a full `cap_ttl` grace from the moment its Broker failed, not from some earlier time.
 - **Retention.** Tombstones are kept for `presence_tombstone_ttl` (10 min).
@@ -485,20 +492,24 @@ docs/protocol.md            endpoint wire protocol spec, for the ESP32 / Elixir 
 
 **Dependencies:** `tailscale.com` (magicsock, wgengine/wireguard-go, netstack, derp), `github.com/coder/websocket`, `github.com/aws/aws-sdk-go-v2/service/s3`, `github.com/pires/go-proxyproto`, `github.com/santhosh-tekuri/jsonschema/v6`, `github.com/fxamacker/cbor/v2`, `google.golang.org/protobuf`, `golang.org/x/crypto/curve25519`.
 
-**Concurrency model:**
-- one goroutine per session for reads and one for writes;
-- per-(session, cap) sequencers;
-- sharded maps for record stores and caches;
-- one coalescing writer and one retry queue per peer link and stream;
-- a membership goroutine that publishes change events consumed by handoff.
+**Concurrency model (rev 6).** All Broker logic lives in `internal/node` as one **deterministic, single-threaded state machine**. It does no I/O and reads no clock or randomness of its own: everything goes through an `Env` interface (monotonic and wall clocks, randomness, timers, peer sends, session frames, S3 requests). The production runtime (`internal/host`) runs one event loop per Broker and does the I/O around it:
+- one goroutine per session for reads and one for writes (bounded queue: 1000 frames or 1 MiB);
+- one coalescing writer goroutine per peer link and stream, dialing lazily; a frame that could not be written is reported back as "not sent";
+- one goroutine per inbound peer stream, and one per S3 request;
+- per-(session, cap) sequencers, acknowledged retry queues per peer and all stores are loop-owned, so they need no locks.
+
+The deterministic simulator (`internal/sim`, [dst.md](dst.md)) drives the same `node` code. If one loop per Broker becomes the bottleneck, JSON parsing, schema validation and X25519 can move to the session goroutines without touching the state machine's semantics.
+
+**Package layout as built (rev 6):** the subsystems above are files of `internal/node` (`membership.go`, `peers.go`, `store.go`, `presence.go`, `caps.go`, `router.go`, `session.go`) rather than separate packages, since they share one loop. Pure pieces are packages: `ids`, `placement`, `caprec` (the cap record; `cap` is a Go builtin), `presence` (registers and classification), `peerproto`, `schema`, `config`. I/O: `s3store`, `mesh` (`TS`: Tailscale data plane; `TCP`: a PSK-authenticated, unencrypted development transport selected by `"mesh":"tcp"` in `cluster.json`), `derpsrv`, `host`. Tools: `cmd/nimbod`, `cmd/nimbo-sim`.
 
 **Observability:** each Broker exposes Prometheus metrics for its stores, retry-queue depth, hinted copies, suspicion, S3 offset and fencing, plus `/debug` endpoints. `nimbod ctl` builds cluster-wide views by listing members from S3 and querying each Broker.
 
 **Testing:**
-- Unit tests for placement, merge rules (property tests that merges are commutative, associative and idempotent), handoff, validation, expiry and presence state classification.
-- An in-process multi-broker harness with an in-memory S3 and an in-memory transport. It includes fault injection: dropped and delayed frames, partitions, S3 errors, clock skew.
-- Netem-based integration tests over the real mesh.
-- Property tests:
+- Unit tests for placement, merge rules (property tests that merges are commutative, associative and idempotent), presence state classification, cap record encoding, schemas and node-key loading.
+- **Deterministic simulation testing** ([dst.md](dst.md)): real `node.Node`s in a seeded simulator with simulated time, network, S3 and endpoints, injecting crashes, restarts, partitions, link resets, latency spikes, S3 errors and outages, clock steps, drains and key rotation. Every seed replays exactly.
+- End-to-end tests over real WebSockets with the TCP mesh and with the Tailscale mesh (`internal/host`).
+- Netem-based integration tests over the real mesh (not yet written).
+- Properties checked by the simulator:
   - no message is delivered twice;
   - no single-use cap is consumed twice;
   - no cap is accepted after 75s idle (with bounded skew);
@@ -565,3 +576,23 @@ These were chosen without the owner; each is easy to change.
 - Optional end-to-end payload encryption using endpoint X25519 keys.
 - Attenuating transfers, where the transferrer adds base fields or tightens the schema.
 - An opt-in `single_use` flag on MintCap for application-level one-shot grants.
+
+## 16. Changes from implementation and DST (revision 6)
+
+Building the design and running it under deterministic simulation changed the following. Each was found by a failing simulation seed unless noted.
+
+| # | Section | Change | Why |
+|---|---|---|---|
+| R1 | §4 | Unfencing takes a new incarnation and announces it. | Peers that declared the fenced Broker dead had tombstoned its registers; when it came back with the same incarnation its endpoints looked absent and their caps died with `target_gone`. |
+| R2 | §4 | An incarnation learned by `Rejoin` beats an older S3 member object. | After an in-place incarnation change, a LIST/GET of the not-yet-rewritten object rolled peers back to the old incarnation and they tombstoned the new registers. |
+| R3 | §4, §5 | Suspicion is reset when a peer changes incarnation. | Handoff to a restarted Broker waited behind suspicion earned by its previous process (up to 2 min); rolling restarts left records under-replicated. |
+| R4 | §9.1 | Presence merge orders by `seq` first; tombstone wins only at equal `seq`; owners bump `seq` on full re-push. | Same failure as R1 through other interleavings: a stale tombstone could permanently shadow a live owner. |
+| R5 | §7.5 | Deadlines use the monotonic clock; the wall clock is only compared with S3 time. | A simulated clock step moved every local deadline and caps were accepted 80s after their last use. |
+| R6 | §4 | The S3 clock offset is the median of the last 5 samples (was an exponential average). | A clock step took too many samples to cross `max_skew`; a skewed Broker stayed unfenced for more than 45s. |
+| R7 | §7.5 | Single-use transfers also use the schema and base blobs. | A cap produced by moving a reply cap outlived its base blob and failed with `unavailable`. |
+| R8 | §6.3 | `durable` waits for 2 placement members, not 1 remote acknowledgement. | Found by reasoning while implementing: with 1 ack two members could still say "not found". |
+| R9 | §7.3 | A positive not-found is re-checked for `lookup_wait` before `invalid_cap`. | Found while implementing: a cap minted on one Broker and used at once through the endpoint's session on another Broker. |
+| R10 | §5 | Peer frames are CBOR, not protobuf. | Avoids a code generator; no behavioural change. |
+| R11 | §11 | One deterministic state machine per Broker behind an `Env`; I/O around it. | Makes the whole Broker simulation-testable. |
+
+Defaults chosen while implementing: the development TCP mesh (`"mesh":"tcp"`, authenticated with the cluster PSK, **not encrypted**); a 1.5s peer dial timeout (below `rpc_timeout`, so dial failures count as "not sent"); 5s `durable` timeout; 10s handshake timeout; replication batches of up to 512 ops with up to 4 batches in flight per peer.

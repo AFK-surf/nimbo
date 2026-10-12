@@ -211,6 +211,11 @@ func (n *Node) sweepRecords() {
 			delete(n.departed, k)
 		}
 	}
+	for id, t := range n.fastJoinNeg {
+		if n.now().After(t) {
+			delete(n.fastJoinNeg, id)
+		}
+	}
 }
 
 func (n *Node) sortedRecKeys() []recKey {
