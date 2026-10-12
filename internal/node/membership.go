@@ -1,0 +1,511 @@
+package node
+
+import (
+	"encoding/hex"
+	"encoding/json"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/afk-surf/nimbo/internal/ids"
+	"github.com/afk-surf/nimbo/internal/peerproto"
+	"github.com/afk-surf/nimbo/internal/placement"
+)
+
+// Membership through S3 (design §4).
+
+type member struct {
+	id       ids.BrokerID
+	info     MemberInfo
+	inc      uint64
+	draining bool
+	lastSeen time.Time // S3 time
+}
+
+type view struct {
+	members map[ids.BrokerID]*member
+	idx     *placement.Index
+	byShort map[ids.Short]ids.BrokerID
+	n       int
+}
+
+func newView(tun Tunables, members map[ids.BrokerID]*member) *view {
+	v := &view{members: members, byShort: map[ids.Short]ids.BrokerID{}, n: tun.VirtualIDs}
+	bs := make([]ids.BrokerID, 0, len(members))
+	for id := range members {
+		bs = append(bs, id)
+		v.byShort[id.Short()] = id
+	}
+	v.idx = placement.New(bs, tun.VirtualIDs)
+	return v
+}
+
+// placementSet returns the k nearest live, non-draining members.
+func (v *view) placementSet(key ids.Hash, k int) []ids.BrokerID {
+	return v.idx.Nearest(key, k, func(b ids.BrokerID) bool { return !v.members[b].draining })
+}
+
+// nearestAll returns the k nearest live members, draining ones included.
+func (v *view) nearestAll(key ids.Hash, k int) []ids.BrokerID {
+	return v.idx.Nearest(key, k, nil)
+}
+
+func memberKey(id ids.BrokerID) string { return "members/" + id.String() + ".json" }
+
+func parseMemberKey(k string) (ids.BrokerID, bool) {
+	s, ok := strings.CutPrefix(k, "members/")
+	if !ok {
+		return ids.BrokerID{}, false
+	}
+	s, ok = strings.CutSuffix(s, ".json")
+	if !ok {
+		return ids.BrokerID{}, false
+	}
+	id, err := ids.ParseBrokerID(s)
+	return id, err == nil
+}
+
+func (n *Node) memberInfo() MemberInfo {
+	mi := n.cfg.Member
+	mi.NodePub = hex.EncodeToString(n.cfg.NodePub)
+	mi.Incarnation = strconv.FormatUint(n.inc, 16)
+	mi.Draining = n.draining
+	if mi.Version == "" {
+		mi.Version = "nimbo/1"
+	}
+	return mi
+}
+
+func (n *Node) memberJSON() []byte {
+	b, err := json.Marshal(n.memberInfo())
+	if err != nil {
+		panic(err)
+	}
+	return b
+}
+
+func (n *Node) selfMember() *member {
+	return &member{id: n.id, info: n.memberInfo(), inc: n.inc, draining: n.draining, lastSeen: n.s3Now()}
+}
+
+// parseMember validates a member object against the Broker ID it is filed
+// under.
+func parseMember(id ids.BrokerID, b []byte) (*member, bool) {
+	var mi MemberInfo
+	if err := json.Unmarshal(b, &mi); err != nil {
+		return nil, false
+	}
+	pub, err := hex.DecodeString(mi.NodePub)
+	if err != nil || ids.BrokerIDFromPub(pub) != id {
+		return nil, false
+	}
+	inc, err := strconv.ParseUint(mi.Incarnation, 16, 64)
+	if err != nil || inc == 0 {
+		return nil, false
+	}
+	return &member{id: id, info: mi, inc: inc, draining: mi.Draining}, true
+}
+
+// s3Now is the local estimate of S3 time.
+func (n *Node) s3Now() time.Time { return n.env.Wall().Add(n.s3Offset) }
+
+func (n *Node) observeDate(start time.Time, date time.Time) {
+	if date.IsZero() {
+		return
+	}
+	end := n.env.Wall()
+	mid := start.Add(end.Sub(start) / 2)
+	// Date has one-second resolution; the true time is in [Date, Date+1s).
+	sample := date.Add(500 * time.Millisecond).Sub(mid)
+	// The offset is the median of the last 5 samples: robust to one slow
+	// response, yet it follows a clock step within 3 samples.
+	n.offSamples = append(n.offSamples, sample)
+	if len(n.offSamples) > 5 {
+		n.offSamples = n.offSamples[1:]
+	}
+	sorted := append([]time.Duration(nil), n.offSamples...)
+	slices.Sort(sorted)
+	n.s3Offset, n.s3OffsetOK = sorted[len(sorted)/2], true
+}
+
+// S3Offset returns the estimated offset of S3 time from the local clock.
+func (n *Node) S3Offset() time.Duration { return n.s3Offset }
+
+func (n *Node) heartbeat() {
+	if n.hbInFlight || n.left || n.leaving || n.stopped {
+		return
+	}
+	n.hbInFlight = true
+	start := n.env.Wall()
+	n.env.S3(S3Request{Op: S3Put, Key: memberKey(n.id), Body: n.memberJSON()}, func(r S3Response) {
+		n.hbInFlight = false
+		if n.stopped || n.left || n.leaving {
+			return
+		}
+		n.observeDate(start, r.Date)
+		if r.Err != nil {
+			n.after(2*time.Second, n.heartbeat)
+			return
+		}
+		t := r.Date
+		if t.IsZero() {
+			t = start.Add(n.s3Offset)
+		}
+		if t.After(n.lastHB) {
+			n.lastHB = t
+		}
+		n.checkFence()
+		if !n.ready {
+			n.poll()
+		}
+	})
+}
+
+func (n *Node) poll() {
+	if n.pollInFlight || n.left || n.stopped || n.lastHB.IsZero() {
+		return
+	}
+	n.pollInFlight = true
+	start := n.env.Wall()
+	n.env.S3(S3Request{Op: S3List, Key: "members/"}, func(r S3Response) {
+		if n.stopped {
+			return
+		}
+		n.observeDate(start, r.Date)
+		if r.Err != nil {
+			// Freeze: keep the last view and expire nobody.
+			n.pollInFlight = false
+			if !n.ready {
+				n.after(2*time.Second, n.poll)
+			}
+			return
+		}
+		next := map[ids.BrokerID]*member{}
+		type need struct {
+			id   ids.BrokerID
+			etag string
+			lm   time.Time
+		}
+		var needs []need
+		s3now := n.s3Now()
+		for _, o := range r.Objects {
+			id, ok := parseMemberKey(o.Key)
+			if !ok || id == n.id {
+				continue
+			}
+			if s3now.Sub(o.LastModified) > n.tun.MemberTTL {
+				continue
+			}
+			if cur := n.view.members[id]; cur != nil && n.knownETags[id] == o.ETag {
+				m := *cur
+				if o.LastModified.After(m.lastSeen) {
+					m.lastSeen = o.LastModified
+				}
+				next[id] = &m
+				continue
+			}
+			needs = append(needs, need{id, o.ETag, o.LastModified})
+		}
+		finish := func() {
+			n.pollInFlight = false
+			n.applyMembers(next)
+			if !n.ready {
+				n.ready = true
+				n.logf("joined: %d members", len(n.view.members))
+				n.announce()
+				n.repushAllPresence()
+			}
+		}
+		if len(needs) == 0 {
+			finish()
+			return
+		}
+		left := len(needs)
+		for _, nd := range needs {
+			nd := nd
+			n.env.S3(S3Request{Op: S3Get, Key: memberKey(nd.id)}, func(g S3Response) {
+				if n.stopped {
+					return
+				}
+				if g.Err == nil && !g.NotFound {
+					if m, ok := parseMember(nd.id, g.Body); ok {
+						m.lastSeen = nd.lm
+						cur := n.view.members[nd.id]
+						if cur != nil && cur.inc != m.inc && !nd.lm.After(cur.lastSeen) {
+							// A Rejoin told us about a newer incarnation
+							// than this object: keep it.
+							c := *cur
+							next[nd.id] = &c
+						} else {
+							next[nd.id] = m
+							n.knownETags[nd.id] = nd.etag
+						}
+					}
+				} else if cur := n.view.members[nd.id]; cur != nil && g.Err != nil {
+					m := *cur
+					next[nd.id] = &m
+				}
+				left--
+				if left == 0 {
+					finish()
+				}
+			})
+		}
+	})
+}
+
+func (n *Node) copyMembers() map[ids.BrokerID]*member {
+	out := make(map[ids.BrokerID]*member, len(n.view.members))
+	for id, m := range n.view.members {
+		c := *m
+		out[id] = &c
+	}
+	return out
+}
+
+// applyMembers installs a new member map, changing the view only if the set
+// of members, an incarnation or a draining flag changed.
+func (n *Node) applyMembers(next map[ids.BrokerID]*member) {
+	next[n.id] = n.selfMember()
+	changed := len(next) != len(n.view.members)
+	if !changed {
+		for id, m := range next {
+			cur := n.view.members[id]
+			if cur == nil || cur.inc != m.inc || cur.draining != m.draining {
+				changed = true
+				break
+			}
+		}
+	}
+	if !changed {
+		// Refresh liveness and info in place.
+		for id, m := range next {
+			*n.view.members[id] = *m
+		}
+		return
+	}
+	n.setView(newView(n.tun, next))
+}
+
+func (n *Node) setView(nv *view) {
+	old := n.view
+	now := n.now()
+	n.prevView, n.view, n.viewChangedAt = old, nv, now
+	n.stats.ViewChanges++
+	for _, id := range sortedBrokerKeys(old.members) {
+		m := old.members[id]
+		if nm := nv.members[id]; nm == nil || nm.inc != m.inc {
+			n.departed[regKey(id, m.inc)] = now
+		}
+	}
+	for _, id := range sortedBrokerKeys(nv.members) {
+		m := nv.members[id]
+		delete(n.departed, regKey(id, m.inc))
+		delete(n.fastJoinNeg, id)
+		if om := old.members[id]; om == nil || om.inc != m.inc {
+			// A new process: suspicion earned by its previous incarnation
+			// no longer applies, and handoff to it must not wait.
+			if p := n.peers[id]; p != nil {
+				p.suspectUntil, p.suspectFor = time.Time{}, 0
+			}
+		}
+	}
+	for _, id := range sortedBrokerKeys(n.peers) {
+		if nv.members[id] == nil {
+			n.dropPeer(id)
+		}
+	}
+	n.onViewChangeStore(old, nv)
+	n.onViewChangePresence(old, nv)
+	ms := make([]Member, 0, len(nv.members))
+	for _, id := range sortedBrokerKeys(nv.members) {
+		ms = append(ms, Member{ID: id, Info: nv.members[id].info})
+	}
+	n.env.MembersChanged(ms)
+}
+
+// announce sends Rejoin to every live member (design §4).
+func (n *Node) announce() {
+	for _, id := range sortedBrokerKeys(n.view.members) {
+		if id != n.id {
+			n.rejoin(id)
+		}
+	}
+}
+
+func (n *Node) rejoin(id ids.BrokerID) {
+	if n.rejoinPending[id] {
+		return
+	}
+	n.rejoinPending[id] = true
+	var try func()
+	try = func() {
+		if n.view.members[id] == nil || n.left {
+			delete(n.rejoinPending, id)
+			return
+		}
+		n.call(id, &peerproto.Envelope{Rejoin: &peerproto.Rejoin{Member: n.memberJSON()}}, func(_ *peerproto.Envelope, err error) {
+			if err != nil {
+				n.after(n.tun.RejoinRetry, try)
+				return
+			}
+			delete(n.rejoinPending, id)
+		})
+	}
+	try()
+}
+
+func (n *Node) handleRejoin(from ids.BrokerID, rj *peerproto.Rejoin) {
+	m, ok := parseMember(from, rj.Member)
+	if !ok {
+		return
+	}
+	m.lastSeen = n.s3Now()
+	next := n.copyMembers()
+	next[from] = m
+	n.applyMembers(next)
+}
+
+// observeIncarnation handles a frame from a known Broker carrying a new
+// incarnation: the Broker restarted (equivalent to a Rejoin).
+func (n *Node) observeIncarnation(from ids.BrokerID, inc uint64) {
+	next := n.copyMembers()
+	m := next[from]
+	m.inc = inc
+	m.lastSeen = n.s3Now()
+	n.applyMembers(next)
+}
+
+// fastJoin admits an unknown Broker if its member object exists and is fresh.
+func (n *Node) fastJoin(id ids.BrokerID) {
+	now := n.now()
+	if n.fastJoinBusy[id] || n.left {
+		return
+	}
+	if t, ok := n.fastJoinNeg[id]; ok && now.Before(t) {
+		return
+	}
+	if !n.fastJoinTok.take(now, 1) {
+		return
+	}
+	n.fastJoinBusy[id] = true
+	start := n.env.Wall()
+	n.env.S3(S3Request{Op: S3Get, Key: memberKey(id)}, func(r S3Response) {
+		if n.stopped {
+			return
+		}
+		delete(n.fastJoinBusy, id)
+		n.observeDate(start, r.Date)
+		var m *member
+		ok := r.Err == nil && !r.NotFound && n.s3Now().Sub(r.LastModified) <= n.tun.MemberTTL
+		if ok {
+			m, ok = parseMember(id, r.Body)
+		}
+		if !ok {
+			n.fastJoinNeg[id] = n.now().Add(n.tun.FastJoinNegTTL)
+			return
+		}
+		m.lastSeen = r.LastModified
+		n.knownETags[id] = r.ETag
+		next := n.copyMembers()
+		next[id] = m
+		n.applyMembers(next)
+	})
+}
+
+func (n *Node) checkFence() {
+	if !n.ready || n.left || n.stopped {
+		return
+	}
+	stale := n.s3Now().Sub(n.lastHB) > n.tun.MemberTTL-n.tun.FenceMargin
+	skew := n.s3OffsetOK && (n.s3Offset > n.tun.MaxSkew || n.s3Offset < -n.tun.MaxSkew)
+	f := stale || skew
+	switch {
+	case f && !n.fenced:
+		n.fenced = true
+		n.stats.Fenced++
+		n.logf("fenced (stale heartbeat=%v, skew=%v)", stale, skew)
+		n.closeAllSessions("fenced")
+	case !f && n.fenced:
+		// Peers may have declared this Broker dead meanwhile and turned its
+		// registers into tombstones. Come back as a new incarnation, exactly
+		// as after a restart, so nothing written under the old one can
+		// shadow new state.
+		n.fenced = false
+		n.newIncarnation()
+		n.logf("unfenced as incarnation %x", n.inc)
+		n.applyMembers(n.copyMembers())
+		n.after(0, n.heartbeat)
+		n.announce()
+		n.repushAllPresence()
+	}
+}
+
+// Drain starts a graceful leave (design §4): mark draining, close sessions,
+// hand off records, then delete the member object.
+func (n *Node) Drain() {
+	if n.draining || !n.started || n.stopped {
+		return
+	}
+	n.draining = true
+	n.drainStarted = n.now()
+	n.logf("draining")
+	n.after(0, n.heartbeat)
+	n.closeAllSessions("draining")
+	n.applyMembers(n.copyMembers())
+	n.announce()
+}
+
+// Draining reports whether Drain was called.
+func (n *Node) Draining() bool { return n.draining }
+
+func (n *Node) sweepDrain() {
+	if !n.draining || n.leaving || n.left {
+		return
+	}
+	idle := len(n.rejoinPending) == 0
+	for _, id := range sortedBrokerKeys(n.peers) {
+		p := n.peers[id]
+		if len(p.q) > 0 || p.inflight > 0 {
+			idle = false
+		}
+	}
+	if !idle && n.now().Sub(n.drainStarted) < n.tun.DrainTimeout {
+		return
+	}
+	n.leaving = true
+	n.env.S3(S3Request{Op: S3Delete, Key: memberKey(n.id)}, func(S3Response) {
+		if n.stopped {
+			return
+		}
+		n.left = true
+		n.logf("left the cluster")
+		n.env.Left()
+	})
+}
+
+// Members returns the current view's member IDs in sorted order.
+func (n *Node) Members() []ids.BrokerID { return sortedBrokerKeys(n.view.members) }
+
+// OnUnknownPeer is called by the runtime when the mesh sees a handshake from
+// a node key that is not a member: the Broker checks S3 (fast join).
+func (n *Node) OnUnknownPeer(id ids.BrokerID) {
+	if n.started && !n.stopped && n.view.members[id] == nil {
+		n.fastJoin(id)
+	}
+}
+
+// UpdateMemberInfo changes this Broker's member object (for example the
+// mesh's disco key, endpoints and home DERP region) and publishes it at once:
+// a heartbeat PUT, and a Rejoin to every member.
+func (n *Node) UpdateMemberInfo(f func(*MemberInfo)) {
+	before := n.memberJSON()
+	f(&n.cfg.Member)
+	if !n.started || n.stopped || string(before) == string(n.memberJSON()) {
+		return
+	}
+	n.after(0, n.heartbeat)
+	n.applyMembers(n.copyMembers())
+	n.announce()
+}
