@@ -45,6 +45,7 @@ func startClusterMesh(t *testing.T, n int, tailscale bool) []*broker {
 		var info struct {
 			sync.Mutex
 			disco string
+			eps   []string
 			h     *host.Host
 		}
 		if tailscale {
@@ -59,13 +60,23 @@ func startClusterMesh(t *testing.T, n int, tailscale bool) []*broker {
 						h.UnknownPeer(id)
 					}
 				},
-				OnLocalInfo: func(disco string, _ []string, _ int) {
+				OnLocalInfo: func(disco string, eps []string, _ int) {
+					// As nimbod does: publish the disco key and the
+					// endpoints magicsock reports (it may rebind ports).
 					info.Lock()
 					info.disco = disco
+					info.eps = eps
 					h := info.h
 					info.Unlock()
 					if h != nil {
-						h.Do(func() { h.Node().UpdateMemberInfo(func(mi *node.MemberInfo) { mi.DiscoPub = disco }) })
+						h.Do(func() {
+							h.Node().UpdateMemberInfo(func(mi *node.MemberInfo) {
+								mi.DiscoPub = disco
+								if len(eps) > 0 {
+									mi.Endpoints = eps
+								}
+							})
+						})
 					}
 				},
 			})
@@ -73,7 +84,12 @@ func startClusterMesh(t *testing.T, n int, tailscale bool) []*broker {
 				t.Fatal(err)
 			}
 			m = ts
-			endpoints = []string{fmt.Sprintf("127.0.0.1:%d", ts.LocalPort())}
+			info.Lock()
+			endpoints = info.eps
+			info.Unlock()
+			if len(endpoints) == 0 {
+				endpoints = []string{fmt.Sprintf("127.0.0.1:%d", ts.LocalPort())}
+			}
 		} else {
 			tm, err := mesh.NewTCP(id, psk, "127.0.0.1:0")
 			if err != nil {

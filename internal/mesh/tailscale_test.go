@@ -42,7 +42,11 @@ func newTSNode(t *testing.T, psk []byte) *tsNode {
 		OnLocalInfo: func(disco string, eps []string, home int) {
 			n.mu.Lock()
 			n.info.DiscoPub = disco
+			n.info.Endpoints = eps
 			n.mu.Unlock()
+			if len(eps) == 0 {
+				return
+			}
 			select {
 			case n.got <- struct{}{}:
 			default:
@@ -62,7 +66,9 @@ func (n *tsNode) member() node.Member {
 	defer n.mu.Unlock()
 	info := n.info
 	info.NodePub = fmt.Sprintf("%x", n.pub[:])
-	info.Endpoints = []string{netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), n.ts.ms.LocalPort()).String()}
+	// Advertise what magicsock reports (as nimbod does), plus loopback on
+	// its current port: magicsock may rebind to a new port after start.
+	info.Endpoints = append([]string{netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), n.ts.LocalPort()).String()}, info.Endpoints...)
 	return node.Member{ID: n.id, Info: info}
 }
 
@@ -73,11 +79,30 @@ func TestTSMeshLoopback(t *testing.T) {
 	psk := make([]byte, 32)
 	rand.Read(psk)
 	a, b := newTSNode(t, psk), newTSNode(t, psk)
-	<-a.got
-	<-b.got
-	ms := []node.Member{a.member(), b.member()}
-	a.ts.SetPeers(ms)
-	b.ts.SetPeers(ms)
+	// Wait briefly for magicsock to report its endpoints; loopback on the
+	// current port is advertised in any case.
+	for _, n := range []*tsNode{a, b} {
+		select {
+		case <-n.got:
+		case <-time.After(5 * time.Second):
+		}
+	}
+	// Keep the peer configuration current, as membership updates do in
+	// production.
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		for {
+			ms := []node.Member{a.member(), b.member()}
+			a.ts.SetPeers(ms)
+			b.ts.SetPeers(ms)
+			select {
+			case <-stop:
+				return
+			case <-time.After(time.Second):
+			}
+		}
+	}()
 
 	done := make(chan string, 1)
 	go func() {
