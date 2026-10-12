@@ -32,11 +32,12 @@ Status: draft for review. The decisions taken with the project owner are listed 
 | **Endpoint** | A WebSocket client. Its identity is its ephemeral X25519 public key, its **Endpoint key**. |
 | **Session** | One authenticated WebSocket connection from an Endpoint to a Broker. An Endpoint may hold sessions to several Brokers at once. |
 | **Capability (cap)** | The right to send Messages to a **target** Endpoint. It is held by exactly one **holder** Endpoint. |
-| **Cap record** | The immutable description of one cap: target, holder, schema, base, auto-reply flag, and so on. |
+| **Cap record** | The immutable description of one cap: target, holder, schema and base hashes, auto-reply flag, and so on. |
+| **Blob** | A schema or base object, addressed by `SHA-256(bytes)`. Blobs are published and replicated in RCR; cap records hold only their hashes. |
 | **Cap ID** | 16 random bytes, written as unpadded lowercase base32 (26 chars). Not secret. |
 | **Token / handle** | What an Endpoint holds: the cap record plus a Merkle inclusion proof, encoded as an opaque string. It is meaningful only to its holder. |
 | **Origin** | The single-writer log of RCR entries a given Broker publishes about itself. |
-| **RCR** | Runtime Control Records: endpoints, cap Merkle roots, cap liveness, broker metadata and metrics. Gossiped as snapshot + WAL per origin. |
+| **RCR** | Runtime Control Records: endpoints, cap Merkle roots, cap liveness, blobs, broker metadata and metrics. Gossiped as snapshot + WAL per origin. |
 | **Action** | Any frame on the endpoint WebSocket. |
 | **Message** | A JSON object sent to a cap. The only data Endpoints exchange. |
 
@@ -98,7 +99,12 @@ Bucket layout under a configured prefix `s3://<bucket>/<prefix>/`:
 This follows tailcat's approach: Tailscale's open-source data plane used directly, with no coordination server and no OS network setup.
 
 - **Components:** `magicsock` for UDP and DERP path selection, NAT traversal and disco; userspace `wireguard-go`; and a gVisor `netstack` that terminates TCP in-process. There is no TUN device and no root.
-- **Keys.** The node key (WireGuard) and disco key live in `--state-dir/node.key`. With no state dir, a fresh key is generated and restart recovery (§9.6) cannot work.
+- **Keys.** The node key (WireGuard private key, which also fixes the Broker ID) is loaded in this order:
+  1. the `NIMBOD_NODE_KEY` environment variable, if set, in Tailscale's text form `privkey:<64 hex>`. This suits containers and Kubernetes Secrets with no persistent volume;
+  2. otherwise `--state-dir/node.key`, which is created on first start;
+  3. otherwise, with neither configured, a fresh key per process. Restart recovery (§9.6) then cannot work.
+
+  An invalid `NIMBOD_NODE_KEY` is a fatal startup error; it never falls back silently. `nimbod keygen` prints a new key. The disco key is regenerated on every start, as in Tailscale.
 - **Addressing.** Each Broker gets a ULA IPv6 `/128` derived from its Broker ID (`fd4e:6d62:6f00::/40` + 88 bits of the ID). The WireGuard peer configuration is rebuilt from membership whenever it changes. Every peer gets `wg_psk` as its pre-shared key, which protects against a DERP operator or anyone holding only public keys, and adds post-quantum protection.
 - **DERP, embedded in `nimbod`.** A Broker configured with a public hostname and a TLS certificate serves DERP at `/derp` on its HTTPS listener (the endpoint WebSocket listener can share it) and STUN on UDP 3478. It advertises itself in its member object. Every Broker builds the same DERP map from membership: relay Brokers with the same configured `region_id` form one DERP region and mesh with each other using `derp_mesh_key`. Brokers without public reachability are DERP clients only. A Cluster needs at least one relay Broker. If all Brokers can reach each other directly over UDP, DERP is used only for rendezvous.
 - **Connections.** Peer RPC listens on TCP `[ula]:7946` inside the netstack. Two connection types:
@@ -142,7 +148,7 @@ Requests carry a client-chosen `rid`. Each gets exactly one `result`: `{"op":"re
 
 | Op (E → B) | Fields | Result |
 |---|---|---|
-| `send` (**SendMessage**) | `cap`, `payload` (JSON object), `caps` (handles to carry, optional), `ttl_ms` (default 10000, max 60000), `reply` (optional: `schema`, `base`, `auto_reply`) | `msg` (message ID). This means the message was accepted for routing, not that it was delivered. |
+| `send` (**SendMessage**) | `cap`, `payload` (JSON object), `caps` (handles to carry, optional), `ttl_ms` (default 10000, max 60000), `reply` (optional: `schema`, `base`, `auto_reply`) | `msg` (message ID) and, if the target cap has `auto_reply`, `reply_id`: the origin ID of the reply cap. Replies arrive as `deliver` with `on = reply_id`, which gives correlation without a per-request `base`. The result means the message was accepted for routing, not that it was delivered. |
 | `mint` (**MintCap**) | `schema` (optional JSON Schema), `base` (optional JSON object), `auto_reply` (bool) | `cap` (handle held by the caller, targeting the caller), `id` (origin cap ID) |
 | `transfer` (**TransferCap**) | `cap`, `to` (Endpoint key) | `cap`: a handle bound to `to`, meaningful only to that Endpoint |
 | `renew` (**RenewCap**) | `caps` (array of handles) | per-cap `{ok, deadline}`. The handles do not change. |
@@ -158,7 +164,7 @@ Error codes: `bad_request`, `invalid_cap`, `not_holder`, `expired`, `schema_viol
 
 ### 6.4 Limits (defaults, from `welcome.limits`)
 
-Payload ≤ 64 KiB, and no larger than the receiver's `max_message_bytes`. Cap record (schema + base) ≤ 8 KiB. Up to 16 carried caps per message. 1000 actions/s per session, 100 mints/s per session, 4096 caps renewed or touched per session per 10s window (§10). Delivery queue per session: 1000 messages or 1 MiB.
+Payload ≤ 64 KiB, and no larger than the receiver's `max_message_bytes`. Schema ≤ 32 KiB, base ≤ 4 KiB. New blob bytes (schema or base not already live in the cluster) ≤ 64 KiB per session per 10s window. Up to 16 carried caps per message. 1000 actions/s per session, 100 mints/s per session, 4096 caps renewed or touched per session per 10s window (§10). Delivery queue per session: 1000 messages or 1 MiB.
 
 ---
 
@@ -179,19 +185,32 @@ Encoded as deterministic CBOR (RFC 8949 §4.2.1):
 | `issuer` | 8B | Short ID of the Broker that rolled this record into its Merkle tree |
 | `inc`, `epoch` | uint | issuer incarnation and batch number |
 | `minted_at` | unix ms | |
-| `schema` | bytes? | JSON Schema (draft 2020-12), inline |
-| `base` | bytes? | JSON object, inline |
+| `schema` | 32B? | blob hash of a JSON Schema (draft 2020-12) |
+| `base` | 32B? | blob hash of a JSON object |
 | `auto_reply` | bool | mint a reply cap on each delivery |
 | `hints` | [≤3]8B | Short IDs of Brokers where `target` was connected when `origin` was minted. Used for routing before gossip arrives. |
 
-Schema and base are **inline**. The token is then self-contained: any Broker can validate and enforce it without fetching anything. Compiled schemas are cached by `SHA-256(schema)`.
+### 7.1a Blobs: schema and base in RCR
+
+Schemas and base objects are **not** in the token. They are content-addressed blobs (`hash = SHA-256(bytes)`) published in RCR. The record holds only their hashes, and the Merkle leaf covers those hashes, so a token cannot be paired with a different schema or base.
+
+- **Publish.** A Broker that issues a record referencing a blob (mint, transfer, translation or reply cap) publishes a `Blob{hash, kind, bytes}` WAL entry in the same flush as the batch root, unless the blob is already live in its view. Transfers, translations and reply caps reuse hashes the Broker already holds from validation, so usually only mints, and a reply cap with a new `reply.base` or `reply.schema`, publish bytes.
+- **Dedup.** Views key blobs by hash. Mints that share a schema publish its bytes once, and every later use costs only liveness touches.
+- **Liveness.** Blobs use the same sliding expiry as caps (§7.6). Publishing a blob sets its deadline to `now + cap_ttl`. Every use of a cap also uses its blobs, which generate touches under the same 10s threshold. A live cap therefore always has live blobs. A blob is dropped once `now > deadline + grace`. A Broker's snapshot includes the bytes of every blob it has published or touched that is still live, so snapshots are self-sufficient.
+- **Lookup miss.** If a Broker validating a token lacks a blob, it fetches it from the issuer with a direct `GetBlobs` RPC, the same path as missing roots (§7.5).
+- **Cost.** Gossip carries blob bytes once per distinct live blob, not once per cap. A unique `base` per mint does cost its bytes in gossip. That is why bases are capped at 4 KiB and new blob bytes have a per-session budget (§6.4). Request/reply correlation uses `reply_id` (§6.3), not a per-request base.
+- Compiled schemas are cached by hash. A token is about 250 bytes plus a ≤512-byte proof, whatever the schema size, which keeps it within ESP32 memory.
 
 ### 7.2 Merkle rollups
 
 Each Broker collects new leaves into a batch:
 
 - `leaf = SHA-256(0x00 ‖ record)` and `node = SHA-256(0x01 ‖ L ‖ R)`. This is the RFC 6962 tree shape and proof format.
-- **Flush policy.** At most one root per `rollup_interval` (50ms, configurable). If no root has been published in the last 50ms, a pending batch is sealed **at once**: idle and low-rate Brokers add no latency. Under load, a batch is sealed on the 50ms tick or when it reaches `rollup_max_leaves` (65536). Root publication is therefore bounded at about 20 per second per Broker, whatever the mint rate.
+- **Flush policy: token bucket with burst.** Root publication is limited by a token bucket. Capacity is `rollup_burst` (default 20 roots) and it refills at one token per `rollup_interval` (50ms, configurable).
+  - While the bucket has tokens, a pending batch is sealed **at once**. Each seal includes every leaf pending at that moment, so a burst of mints, or a lone mint on an idle Broker, adds no batching latency.
+  - Once the bucket is empty, sealing falls back to the 50ms tick, or happens early when a batch reaches `rollup_max_leaves` (65536).
+  - The bucket refills during quiet periods, so a Broker can absorb short bursts at full speed and only degrades to 50ms batching under sustained load.
+  - Root publication per Broker is bounded at `rollup_burst + t / rollup_interval` roots over any window of length `t`: about 20 per second sustained, whatever the mint rate.
 - The sealed root becomes one RCR WAL entry `CapRoot{inc, epoch, root, size, sealed_at}`. A batch of one leaf is the "direct" case: its root is the leaf.
 - Mint, transfer, translation and reply-cap minting all wait for their batch to seal before returning or delivering the token. That wait is the latency-for-boundedness trade-off.
 
@@ -202,16 +221,16 @@ token = 0x01 ‖ varint(len) ‖ record ‖ varint(leaf_index) ‖ varint(tree_s
 handle = "ncap1." ‖ base64url(token)
 ```
 
-The token is not secret: it is bound to `holder`, and using it requires a session authenticated as `holder`. A typical handle with no schema is about 250 bytes; the worst case is about 9 KiB.
+The token is not secret: it is bound to `holder`, and using it requires a session authenticated as `holder`. A handle is at most about 1 KiB (a ~250-byte record plus a ≤512-byte proof, in base64url), however large the schema or base.
 
 ### 7.4 Operations
 
 All of these happen on the Broker that receives the Action. Brokers keep **no per-endpoint cap tables**: tokens are stateless apart from the liveness entries in §7.6.
 
-- **MintCap.** Record `{kind: mint, target = holder = caller, origin = id, hints = brokers the caller is connected to}`. Returns the token once its batch seals.
+- **MintCap.** Hashes the supplied schema and base, compiles the schema (rejecting an invalid one), and builds the record `{kind: mint, target = holder = caller, origin = id, hints = brokers the caller is connected to}`. Returns the token once its batch seals; new blobs are published in the same flush (§7.1a).
 - **TransferCap(cap, to).** Validates that the caller holds `cap`, counting it as a use (§7.6). Mints `{kind: transfer, holder = to}`, copying target, schema, base, auto_reply, origin and hints. It is **never** gated on whether `to` exists, is connected or is known, so it leaks nothing about `to`. The original token stays valid. This is the out-of-band bootstrap path: an owner service transfers a cap to a sandbox's public key and hands the sandbox the returned handle, for example through an environment variable.
 - **Translation of carried caps** happens at the receive-side (egress) Broker (§8.2). It is the same as a transfer to the receiver, minted and rolled up by the egress Broker.
-- **Reply caps.** When a Message is delivered on a cap with `auto_reply`, the egress Broker mints `{kind: reply, target = sender, holder = receiver, origin = new id, hints = sender's brokers}`. Its `schema`, `base` and `auto_reply` come from the sender's `send.reply` options, each defaulting to none, `{}` and `false`. The base fields are set by the sender and cannot be forged by the receiver, so the sender can use them for correlation, for example `{"req": 42}`.
+- **Reply caps.** When a Message is delivered on a cap with `auto_reply`, the egress Broker mints `{kind: reply, target = sender, holder = receiver, origin = reply_id, hints = sender's brokers}`. `reply_id` is chosen at ingress and returned to the sender in the `send` result (§6.3), so the sender can match replies without any blob. Its `schema`, `base` and `auto_reply` come from the sender's `send.reply` options, each defaulting to none, none and `false`. The ingress Broker hashes and publishes any reply schema or base blob, and the Forward carries only their hashes.
 
 ### 7.5 Validation (at the ingress Broker, for every use)
 
@@ -224,7 +243,8 @@ Given a handle presented by session `S` authenticated as Endpoint key `K`:
    - known: verify the inclusion proof. Valid → OK.
    - unknown (gossip hasn't arrived yet): send a direct `GetRoots` RPC to the issuer over a data link (singleflight, 1 RTT). If the issuer is unreachable, wait up to `root_wait` (2s) for gossip, else fail with `unavailable` (retryable).
 5. Otherwise the token is `expired`.
-6. If the target Endpoint has had no session anywhere for more than `cap_ttl`, fail with `target_gone`, and the use does not extend the deadline. This is how caps to departed ephemeral Endpoints die. It tells a holder whether its target is present, which the holder could already learn by sending.
+6. Resolve the `schema` and `base` blobs from the view. On a miss, fetch them with `GetBlobs` from the issuer, using the same singleflight, `root_wait` fallback and `unavailable` error as for roots. A fetched blob must hash to the requested value.
+7. If the target Endpoint has had no session anywhere for more than `cap_ttl`, fail with `target_gone`, and the use does not extend the deadline. This is how caps to departed ephemeral Endpoints die. It tells a holder whether its target is present, which the holder could already learn by sending.
 
 Roots only need to be kept for `cap_ttl + grace` plus a margin: 90s.
 
@@ -235,6 +255,7 @@ Roots only need to be kept for `cap_ttl + grace` plus a margin: 90s.
 **Mechanism: soft, eventually consistent.**
 
 - Each Broker keeps `local_deadline[lid]` for caps used through it. Every use sets it to `now + cap_ttl`.
+- The same rule applies to the cap's `schema` and `base` blobs, keyed by blob hash. A blob shared by many caps generates at most one touch per Broker per 10s.
 - If `local_deadline − last_published_deadline ≥ touch_threshold` (10s), the Broker queues a `Touch{lid, deadline}`. Touches are flushed in the same 50ms cadence as roots, as one `CapTouches` WAL entry per flush, and are deduplicated within the window.
 - Every Broker folds received touches into `liveness[lid] = max(deadline)`, and drops an entry once `now > deadline + grace`.
 - `grace` (15s) covers the touch threshold, gossip lag and clock skew. Effective expiry is therefore **60–75s after the last use, as seen across the Cluster**. A cap used within the last 60s is accepted everywhere when gossip lag is under about 5s. A cap idle for more than 75s is rejected everywhere.
@@ -250,11 +271,11 @@ Roots only need to be kept for `cap_ttl + grace` plus a margin: 90s.
 ### 8.1 Ingress (sender's Broker)
 
 1. Validate the target cap (§7.5) and every carried cap. Carried caps must also be held by the sender. Each validated cap counts as a use (§7.6).
-2. The payload must be a JSON object. Validate it against `record.schema` if one is set. The **base fields are not** covered by the schema.
-3. Merge `record.base` into the payload shallowly. If the payload already has a top-level key that is in `base`, reject with `base_conflict`.
+2. The payload must be a JSON object. Validate it against the schema blob, if `record.schema` is set. The **base fields are not** covered by the schema.
+3. Merge the base blob into the payload shallowly. If the payload already has a top-level key that is in `base`, reject with `base_conflict`.
 4. Assign `msg` (16 random bytes), set `deadline = now + ttl_ms`, and reply `result{ok, msg}`.
 5. **Route.** The candidates are the Brokers that list a live session for `record.target` in the RCR endpoint directory (§9.4), plus `record.hints`. Prefer local delivery. Otherwise pick by rendezvous hash of `(record.id, broker id)` among the candidates. That keeps a single sender's messages on one cap on one path, so they arrive FIFO.
-6. Send `Forward{msg, deadline, hop, target_record, payload, carried_records[], reply_opts, ingress}` over a data link. The target cap's record and the carried records travel with the message. This is the fast path: the egress Broker never needs to look them up and trusts the ingress Broker's validation.
+6. Send `Forward{msg, deadline, hop, target_record, payload, carried_records[], reply_id, reply_opts (blob hashes + auto_reply), ingress}` over a data link. The target cap's record and the carried records travel with the message. This is the fast path: the egress Broker never needs to look them up and trusts the ingress Broker's validation.
 
 ### 8.2 Egress (target's Broker)
 
@@ -288,9 +309,10 @@ Each Broker is the **only writer** of its origin log, which is `(broker_id, inca
 | `Heartbeat` | every 10s: session count, msg/s in and out, bytes/s, queue depth, CPU and memory, gossip lag |
 | `EndpointUp` / `EndpointDown` | `key`, `session`, `at` (Up and Down in the same 50ms window are coalesced) |
 | `CapRoot` | `epoch`, `root`, `size`, `sealed_at` |
-| `CapTouches` | `[(lid, deadline)]` |
+| `CapTouches` | `[(lid, deadline)]` and `[(blob_hash, deadline)]` |
+| `Blob` | `hash`, `kind` (schema/base), `bytes`. Published in the same flush as the root that first references it. |
 
-The **snapshot** is the folded state of an origin at some `seq`: BrokerInfo, last metrics, live sessions, roots younger than 90s, and this origin's unexpired touches. The owner writes a new snapshot when the WAL since the last one exceeds the snapshot's size, or every 30s, and then truncates the WAL. Merging is always per origin: a higher `(incarnation, seq)` replaces a lower one, and nothing is ever merged across writers. This is why no consensus is needed.
+The **snapshot** is the folded state of an origin at some `seq`: BrokerInfo, last metrics, live sessions, roots younger than 90s, this origin's unexpired touches, and the bytes of live blobs this origin has published or touched. The owner writes a new snapshot when the WAL since the last one exceeds the snapshot's size, or every 30s, and then truncates the WAL. Merging is always per origin: a higher `(incarnation, seq)` replaces a lower one, and nothing is ever merged across writers. This is why no consensus is needed.
 
 ### 9.2 Gossip peers (decided: N XOR-nearest + ring links)
 
@@ -317,9 +339,10 @@ Each Broker folds all origin states into in-memory indexes:
 - **Endpoint directory:** `key → {(broker, session, since)}`. Only origins whose Broker is currently in S3 membership count for routing.
 - **Roots:** `(issuer, inc, epoch) → root`.
 - **Liveness:** `lid → max deadline`.
+- **Blobs:** `hash → (bytes, max deadline)`, with compiled schemas cached alongside.
 - **Brokers:** metrics and info for observability and `welcome.brokers` suggestions.
 
-Rough memory at 1M endpoints and 1M live caps is about 100 MB for the directory, 40 MB for liveness and under 10 MB for roots.
+Rough memory at 1M endpoints and 1M live caps is about 100 MB for the directory, 40 MB for liveness and under 10 MB for roots. Blob memory depends on how many distinct schemas and bases are live; with shared schemas and small bases it should stay under ~100 MB.
 
 ### 9.5 Retention
 
@@ -330,20 +353,21 @@ A Broker keeps the snapshot + WAL of origins it does not own for up to `rcr_rete
 On start, with a persisted node key:
 
 1. Join membership and the mesh. Before accepting endpoints, ask the `gossip_n` nearest peers for **its own** origin's latest snapshot + WAL. Wait up to `recover_timeout` (5s).
-2. Start a new incarnation `inc' = max(recovered_inc + 1, unix_ms)`. Publish a snapshot that carries over the unexpired roots and touches. Sessions are not carried over; their endpoints have disconnected and will reconnect. Peers replace the old incarnation with this one.
+2. Start a new incarnation `inc' = max(recovered_inc + 1, unix_ms)`. Publish a snapshot that carries over the unexpired roots, touches and blobs. Sessions are not carried over; their endpoints have disconnected and will reconnect. Peers replace the old incarnation with this one.
 3. If nothing is recovered, start with a fresh incarnation.
 
-Why it matters: without it, a new empty incarnation would replace the old one everywhere. The roots and touches that keep this Broker's previously issued tokens valid would be wiped, and live caps would break.
+Why it matters: without it, a new empty incarnation would replace the old one everywhere. The roots, touches and blobs that keep this Broker's previously issued tokens valid would be wiped, and live caps would break.
 
 ---
 
 ## 10. Security and abuse resistance
 
 - **Trust boundaries.** S3 write access means cluster admin. Brokers fully trust each other. Endpoints are untrusted. DERP relays and the network see only WireGuard ciphertext, protected by a PSK.
-- **Unforgeability.** A token is valid only through a Merkle proof against a root its issuer published, or through a liveness entry that a Broker created after full validation. Holder binding means a leaked handle is useless without the holder's private key.
+- **Unforgeability.** A token is valid only through a Merkle proof against a root its issuer published, or through a liveness entry that a Broker created after full validation. Holder binding means a leaked handle is useless without the holder's private key. Blob hashes are inside the Merkle leaf, and blobs are content-addressed, so a schema or base cannot be substituted.
 - **No side channels on transfer.** TransferCap does not look at the recipient.
-- **Permissionless DoS.** Limits per IP on handshakes and per session on actions, mints, carried caps and bytes. Payload size and schema-compile limits: schema ≤ 8 KiB, no remote `$ref`, compile time capped.
+- **Permissionless DoS.** Limits per IP on handshakes and per session on actions, mints, carried caps and bytes. Payload size and schema-compile limits: schema ≤ 32 KiB, no remote `$ref`, compile time capped.
 - **Touch amplification.** An endpoint could mint many caps and renew them to inflate gossip. The touch budget per session (4096 distinct caps per 10s) caps this; uses beyond the budget fail with `rate_limited` and are not touched.
+- **Blob amplification.** An endpoint could mint caps with a fresh unique base each time, pushing new bytes into gossip. The new-blob budget per session (64 KiB per 10s) caps this; mints beyond it fail with `rate_limited`.
 - **Replay of handshake.** The broker's ephemeral key and the nonce are single-use, and the proof binds the dialed authority.
 - **Payload privacy.** Brokers see payloads in clear (they must validate schemas). End-to-end encryption is a future layer and could use the endpoint X25519 keys.
 
@@ -360,7 +384,7 @@ internal/derpsrv/           embedded DERP server + STUN, DERP map from membershi
 internal/peerproto/         protobuf messages + framing for broker↔broker
 internal/gossip/            origin logs, snapshot/WAL, digests, peer selection (XOR + ring), sync
 internal/rcr/               entry types, folding into views (directory, roots, liveness, brokers)
-internal/cap/               record (deterministic CBOR), merkle (RFC 6962), token codec, rollup batcher, validator, liveness
+internal/cap/               record (deterministic CBOR), merkle (RFC 6962), token codec, rollup batcher (token bucket), validator, liveness, blob store
 internal/schema/            JSON Schema compile cache and validation
 internal/router/            ingress/egress, Forward, TTL queues, bounces, rendezvous routing
 internal/wsapi/             WebSocket server, handshake, Action codec, session lifecycle, limits
@@ -379,7 +403,7 @@ docs/protocol.md            endpoint wire protocol spec, for the ESP32 / Elixir 
 
 ## 12. Milestones
 
-1. **Single broker:** WebSocket API, handshake, mint/transfer/renew/send, Merkle rollup, tokens, schema and base, reply caps, Go SDK.
+1. **Single broker:** WebSocket API, handshake, mint/transfer/renew/send, Merkle rollup with burst bucket, tokens, schema and base blobs (local only), reply caps, Go SDK.
 2. **Mesh + membership:** S3 membership, magicsock mesh, embedded DERP, Forward between Brokers, endpoint directory (temporarily via direct broadcast).
 3. **RCR gossip:** origin logs, snapshot + WAL, XOR + ring peers, liveness touches, root fetch, restart recovery, 4h retention.
 4. **Hardening:** limits and touch budgets, metrics and debug endpoints, chaos tests, protocol spec for third-party SDKs (ESP32 C, Elixir).
@@ -400,21 +424,24 @@ Decided with the project owner on 2026-10-12:
 | D6 | DERP relays | **Embedded in `nimbod`**, DERP map built from S3 membership |
 | D7 | Payload model | **JSON object only.** JSON text frames for all Actions. |
 | D8 | Scale target | **~100 Brokers / ~1M endpoints / ~1M live caps** |
+| D9 | Where schema and base live | **In RCR** as content-addressed blobs; the cap record holds only their hashes (§7.1a) |
+| D10 | Broker node key source | **`NIMBOD_NODE_KEY` env var first**, then `--state-dir/node.key`, then a fresh key (§5) |
+| D11 | Rollup latency | **Burst allowance** (token bucket, `rollup_burst` = 20) before falling back to 50ms batching (§7.2) |
 
 ## 14. Defaults open to change
 
 These were chosen without the owner; each is easy to change.
 
-1. **Schema and base inline in the token**, capped at 8 KiB, so validation is stateless. The alternative is content-addressed schemas gossiped in RCR, with smaller tokens and more state.
-2. **A base field collision rejects** the message (`base_conflict`) rather than letting the base silently overwrite the payload key.
-3. **Reply caps are ordinary caps**: reusable until idle for 60s, not single-use. The sender sets their schema, base and auto_reply.
-4. **Validation at ingress** (sender's Broker). Invalid traffic never crosses the mesh, and egress trusts ingress.
-5. **Missing root:** direct `GetRoots` RPC to the issuer before falling back to waiting for gossip.
-6. **Persisted node key** (`--state-dir`) for Broker identity. Without it there is no restart recovery.
+1. **Blob limits and budget:** schema ≤ 32 KiB, base ≤ 4 KiB, 64 KiB of new blob bytes per session per 10s. **Blob liveness** reuses the cap touch mechanism (§7.1a).
+2. **`reply_id`** is returned by `send` so that replies can be correlated without a per-request base blob.
+3. **A base field collision rejects** the message (`base_conflict`) rather than letting the base silently overwrite the payload key.
+4. **Reply caps are ordinary caps**: reusable until idle for 60s, not single-use. The sender sets their schema, base and auto_reply.
+5. **Validation at ingress** (sender's Broker). Invalid traffic never crosses the mesh, and egress trusts ingress.
+6. **Missing root or blob:** a direct `GetRoots` / `GetBlobs` RPC to the issuer before falling back to waiting for gossip.
 7. **A use does not extend a cap whose target has been absent for more than 60s** (`target_gone`), so caps to departed ephemeral endpoints die.
 8. **No sender identity** in `deliver`, beyond what the reply cap's record implies.
 9. **S3 timings:** heartbeat 15s, poll 30s, member TTL 60s, plus a fast-join GET on contact from an unknown key.
-10. **Tunables:** `gossip_n=8`, `rollup_interval=50ms`, `cap_ttl=60s`, `touch_threshold=10s`, `grace=15s`, `rcr_retention=4h`.
+10. **Tunables:** `gossip_n=8`, `rollup_interval=50ms`, `rollup_burst=20`, `cap_ttl=60s`, `touch_threshold=10s`, `grace=15s`, `rcr_retention=4h`.
 
 ## 15. Future work
 
