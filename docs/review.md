@@ -248,3 +248,29 @@ These don't change any owner decision:
 2. **M3:** lazy replication for reply caps, and whether reply caps should be single-use.
 3. **M4:** virtual IDs per Broker (16).
 4. **H2:** anti-entropy between XOR neighbours. Without it, convergence after a partition cannot be guaranteed. It is the biggest piece of new machinery.
+
+---
+
+## 6. Resolution (design revision 5)
+
+The owner approved all fixes, with two changes: reply caps are **single-use**, and there is **no anti-entropy**. Every long-lived record is refreshed by its writer, so refreshes repair missing copies (design §7.6).
+
+| Finding | Status | Where in design rev 5 |
+|---|---|---|
+| C1 presence glitch kills caps | Fixed. Prune → tombstone with `absent since = prune time`. "Gone" needs positive evidence of `cap_ttl` continuous absence; unknown ≠ gone. Self-fencing. | §4, §9.1, §8.4 step 5 |
+| H1 ghost sessions | Fixed. Per-(endpoint, owner, incarnation) LWW registers carrying full state, read repair on `not_here`, max 2 re-routes. | §9.1, §9.2 step 8 |
+| H2 lost writes never repaired | Fixed without anti-entropy: acked Store/Touch with retry queues, hinted copies, `missing` → re-store, holder retention `+touch_threshold`, blob cache TTLs, fail-closed blobs, handoff carries state. | §7.2, §7.4, §7.5, §7.6 |
+| H3 clock dependence | Fixed. S3 `Date` offset, liveness in S3 time, fencing beyond 3s skew, relative TTLs clamped on receipt. | §4, §5, §7.2 |
+| H4 S3 failure modes | Fixed. Freeze on LIST failure, self-fencing, fast-join negative cache and rate limit. | §4 |
+| H5 slow failure detection, dial failures | Fixed. Local suspicion (2s RPC timeout), hinted writes, retry of unsent Forwards. | §5, §7.2, §9.2, §9.5 |
+| M1 transient misses reported as permanent | Fixed. Lookup outcomes found / positive not-found / `unavailable`, plus the previous view during handoff. | §7.3 |
+| M2 issuer copy not findable | Fixed (D16). 3 nearest by cap ID, plus a pinned issuer cache copy. | §7.1 |
+| M3 reply-cap volume | Fixed (D17). Single-use reply caps stored only on the issuer, with no replication. Rejection-sampled IDs make the issuer the nearest Broker, so it is findable and the sole arbiter. | §7.1, §8.3, §8.4 step 6 |
+| M4 load imbalance | Fixed (D18). 16 virtual IDs per Broker, ~1.3× max/mean. | §7.1 |
+| M5 watch race | Fixed. Check-then-register watches, a 2s backstop re-lookup, hints for unknown targets. | §9.4 |
+| M6 incarnation undefined | Fixed. Random 64-bit nonce, equality comparison. | §2, §4 |
+| M7 FIFO | Fixed. Per-(session, cap) sequencer; held messages keep their place; claim stated precisely. | §9.2, §9.5 |
+| M8 DoS and overload | Fixed. PROXY protocol, per-IP session and handshake limits with burst, per-session created-cap quota, per-Broker mint admission, bounded retry queues with back-pressure, held-message cap, jittered reconnects. | §6.1, §6.4, §10 |
+| L1 leave ordering | Fixed. `draining` flag, then closing, handoff, delete. | §4 |
+| L2 crash right after mint | Fixed. Opt-in `durable` on mint and transfer. | §6.3 |
+| L3 cost omission | Fixed. PUT cost included. | §4 |

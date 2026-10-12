@@ -2,7 +2,7 @@
 
 Nimbo is a distributed, capability-based messaging fabric for AI agents, isolated runtimes and external devices. This document refines the concept notes into a design that can be built. It is written in Go and ships as one binary, `nimbod`.
 
-Status: draft for review. The decisions taken with the project owner are listed in [§13](#13-decision-log). Defaults chosen without the owner, which are open to change, are in [§14](#14-defaults-open-to-change).
+Status: draft for review, revision 5. It incorporates the fixes from the [design review](review.md). The decisions taken with the project owner are listed in [§13](#13-decision-log). Defaults chosen without the owner, which are open to change, are in [§14](#14-defaults-open-to-change).
 
 ---
 
@@ -14,6 +14,7 @@ Status: draft for review. The decisions taken with the project owner are listed 
 - Endpoints are permissionless and untrusted. Connecting to a Broker grants nothing. All authority comes from Capabilities.
 - Sending to an Endpoint looks the same to the sender whether that Endpoint is on the same Broker or a different one.
 - No control state is replicated to every Broker. Each record (a cap, an endpoint's presence, a schema or base blob) lives on a small, fixed number of Brokers chosen by XOR distance. The cost of a record is the same whatever the Cluster size.
+- **Convergence by refresh.** Every record that outlives `cap_ttl` is periodically re-sent by whoever writes it. Records that are not refreshed expire. Replicas therefore converge without background anti-entropy (§7.6).
 - Endpoints range from multi-tenant services to ESP32 devices. The endpoint protocol must be implementable with only X25519, HMAC-SHA256, JSON and WebSocket.
 
 **v1 scale target:** ~100 Brokers, ~1M concurrent Endpoints and ~1M long-lived Capabilities in active use across the Cluster. Nothing in the design replicates per-endpoint or per-cap state to every Broker. Larger clusters are limited mainly by S3 membership polling and by every Broker knowing the full member list, which stays manageable into the low thousands.
@@ -28,14 +29,18 @@ Status: draft for review. The decisions taken with the project owner are listed 
 |---|---|
 | **Broker** | A `nimbod` process. Fully trusts every other Broker in its Cluster. |
 | **Cluster** | The Brokers listed in one S3 prefix. |
-| **Broker ID** | `SHA-256(node_public_key)`, 32 bytes. Used for XOR distance. **Short ID** = its first 8 bytes. |
+| **Broker ID** | `SHA-256(node_public_key)`, 32 bytes. **Short ID** = its first 8 bytes. |
+| **Virtual IDs** | `SHA-256(broker_id ‖ i)` for `i = 0..15`. A Broker's 16 positions in XOR space, used for placement (§7.1). |
+| **Incarnation** | A random 64-bit nonce chosen at each process start. Compared only for equality. |
 | **Endpoint** | A WebSocket client. Its identity is its ephemeral X25519 public key, its **Endpoint key**. |
 | **Session** | One authenticated WebSocket connection from an Endpoint to a Broker. An Endpoint may hold sessions to several Brokers at once. |
 | **Capability (cap)** | The right to send Messages to a **target** Endpoint. It is held by exactly one **holder** Endpoint. |
 | **Cap ID** | 16 random bytes, written as unpadded lowercase base32 (26 chars). It **is** the token an Endpoint holds. Not secret, and meaningful only to its holder. |
-| **RCR** | Runtime Control Records: **cap records**, **presence records** and **blobs**. Each one is stored on its placement set (below) and is never gossiped cluster-wide. |
+| **Single-use cap** | A cap consumed by its first send. Reply caps are single-use. |
+| **RCR** | Runtime Control Records: **cap records**, **presence registers** and **blobs**. Each one is stored on its placement set and is never gossiped cluster-wide. |
 | **Placement key** | The 32-byte value a record is placed by: `SHA-256(cap ID)` for caps, `SHA-256(endpoint key)` for presence, and the blob hash for blobs. |
-| **Placement set** | The Brokers that store a record: the 3 live Brokers nearest to its placement key by XOR distance. For caps it is the issuing Broker plus the 2 nearest others. |
+| **Placement set** | The 3 distinct live Brokers nearest to a placement key by XOR distance over virtual IDs. Brokers that are draining are excluded. |
+| **Suspect** | A Broker this Broker currently cannot reach (§5). Suspicion is local only. |
 | **Blob** | A schema or base object, addressed by `SHA-256(bytes)`. |
 | **Action** | Any frame on the endpoint WebSocket. |
 | **Message** | A JSON object sent to a cap. The only data Endpoints exchange. |
@@ -59,17 +64,17 @@ Status: draft for review. The decisions taken with the project owner are listed 
          └─── WireGuard over UDP / DERP ─┘
                          │
                   ┌──────▼──────┐
-                  │ S3 bucket   │  membership + cluster secrets (root of trust)
+                  │ S3 bucket   │  membership + cluster secrets + reference clock
                   └─────────────┘
 ```
 
 A Broker has six internal subsystems:
 
-1. **Membership**: reads and writes `members/` in S3. It is the only state every Broker shares.
-2. **Mesh**: an in-process Tailscale data plane. Brokers reach each other on private IPv6 addresses through a userspace TCP/IP stack.
-3. **RCR store**: XOR placement, replication, lookup, handoff and liveness for cap, presence and blob records (§7).
-4. **Capabilities**: minting, transfer, validation and sliding expiry (§8).
-5. **Router**: ingress validation, endpoint location, egress delivery, forwarding between Brokers, TTL queues (§9).
+1. **Membership**: reads and writes `members/` in S3, tracks the S3 clock offset, and fences the Broker itself if it cannot heartbeat (§4).
+2. **Mesh**: an in-process Tailscale data plane, plus per-peer suspicion (§5).
+3. **RCR store**: XOR placement, acknowledged replication, lookup, handoff and expiry for cap, presence and blob records (§7).
+4. **Capabilities**: minting, transfer, validation, sliding expiry and single-use consumption (§8).
+5. **Router**: ingress validation and sequencing, endpoint location, egress delivery, forwarding, TTL queues (§9).
 6. **Endpoint API**: WebSocket server, handshake and Actions (§6).
 
 ---
@@ -81,18 +86,31 @@ Bucket layout under a configured prefix `s3://<bucket>/<prefix>/`:
 | Key | Content | Writer |
 |---|---|---|
 | `cluster.json` | `cluster_id`, `wg_psk` (32B), `derp_mesh_key`, protocol version, cluster-wide tunables. | Created once by `nimbod init` with a conditional `If-None-Match: *` PUT. Read by every Broker at startup. |
-| `members/<broker-id-hex>.json` | `node_pub`, `disco_pub`, `incarnation`, `version`, `ws_urls[]`, `derp` (region ID/code, hostname, IPv4/IPv6, STUN port) if this Broker serves DERP, `region`. | That Broker only. |
+| `members/<broker-id-hex>.json` | `node_pub`, `disco_pub`, `incarnation` (random nonce), `draining` (bool), `version`, `ws_urls[]`, `derp` (region ID/code, hostname, IPv4/IPv6, STUN port) if this Broker serves DERP, `region`. | That Broker only. |
 
-- **Heartbeat.** Each Broker re-PUTs its member object every `member_heartbeat` (15s). The content holds no timestamps, so the ETag (MD5) stays the same and only `LastModified` moves. Liveness is judged from `LastModified`, which is S3's clock, so it does not depend on broker clocks.
-- **Discovery.** Each Broker LISTs `members/` every `member_poll` (30s). It GETs an object only when its ETag changed. A member whose `LastModified` is older than `member_ttl` (60s) counts as dead. Cost at 100 Brokers is roughly 9M LIST requests a month, about $45.
-- **Fast join.** A new Broker's peers would otherwise wait up to one poll interval to learn about it. Instead, when the mesh sees a disco or WireGuard handshake from an unknown node key, it GETs `members/<SHA-256(key)>.json` directly. If the object exists and is fresh, the peer is added at once. Existence in S3 is the admission check.
-- **Rejoin announce.** On start, after writing its member object, a Broker sends `Rejoin{incarnation}` directly to every live member. This updates their membership view at once and triggers handoff to it (§7.4), instead of waiting for the next poll.
-- **Leave.** On graceful shutdown a Broker hands off its records (§7.4) and then DELETEs its member object.
-- Any S3-compatible store works: AWS, R2, MinIO, GCS through its S3 API. The client is `aws-sdk-go-v2`.
+- **Clock reference.** Every S3 response carries a `Date` header. The Broker keeps a smoothed offset `s3_offset = Date − local midpoint of the request`, accurate to about ±1s. **S3 time** is `local now + s3_offset`. All membership liveness is judged in S3 time. If `|s3_offset|` exceeds `max_skew` (3s), the Broker fences itself (below) until NTP fixes the clock.
+- **Heartbeat.** Each Broker re-PUTs its member object every `member_heartbeat` (15s). The content holds no timestamps, so the ETag stays the same and only `LastModified` moves.
+- **Discovery.** Each Broker LISTs `members/` every `member_poll` (30s). It GETs an object only when its ETag changed. A member is dead when `S3 time − LastModified > member_ttl` (60s).
+  - **Freeze on failure:** if a LIST fails, the Broker keeps its last membership view and expires **nobody** until a LIST succeeds.
+- **Self-fencing.** If a Broker's own last successful heartbeat is older than `member_ttl − 15s` (S3 time), or its clock is out of bounds:
+  - it sends `closing` with a jittered `retry_after_ms` to all its sessions;
+  - it stops accepting new sessions;
+  - it stops acting as a write target.
+
+  Its endpoints move to healthy Brokers before peers declare it dead, so it never becomes a black hole. Fencing lifts once heartbeats succeed and the clock is within bounds again.
+- **Fast join.** When the mesh sees a handshake from an unknown node key, the Broker GETs `members/<SHA-256(key)>.json`. If the object exists and is fresh, the peer is added at once; existence in S3 is the admission check.
+  - **Abuse limits:** misses are cached negatively for 60s, and fast-join GETs are globally rate limited (10/s per Broker). Random handshake attempts therefore cannot amplify S3 load.
+- **Rejoin announce.** On start, after writing its member object, a Broker sends `Rejoin{incarnation}` to every live member. This updates their views at once and triggers handoff to it (§7.4).
+- **Graceful leave**, in this order:
+  1. PUT the member object with `draining: true` and announce it. Peers stop choosing this Broker as a write target but keep querying it.
+  2. Send `closing` to sessions.
+  3. Hand off all records (§7.4).
+  4. DELETE the member object.
+- **Cost** at 100 Brokers is about 8.6M LISTs plus 17M heartbeat PUTs a month, about $130. Any S3-compatible store works (AWS, R2, MinIO, GCS through its S3 API), with `aws-sdk-go-v2`.
 
 **Trust model.** Write access to the prefix is cluster admin. `cluster.json` holds the WireGuard pre-shared key and the DERP mesh key.
 
-Membership is the input to every placement decision. Brokers can briefly disagree on it (by up to one poll interval), and the lookup fan-out and handoff in §7 are sized to absorb that.
+Membership is the input to every placement decision. Brokers can disagree on it for up to one poll interval, or less after a Rejoin. Lookups, write fallbacks and handoff (§7) are designed to absorb that.
 
 ---
 
@@ -110,9 +128,13 @@ This follows tailcat's approach: Tailscale's open-source data plane used directl
 - **Addressing.** Each Broker gets a ULA IPv6 `/128` derived from its Broker ID (`fd4e:6d62:6f00::/40` + 88 bits of the ID). The WireGuard peer configuration is rebuilt from membership whenever it changes. Every peer gets `wg_psk` as its pre-shared key, which protects against a DERP operator or anyone holding only public keys, and adds post-quantum protection.
 - **DERP, embedded in `nimbod`.** A Broker configured with a public hostname and a TLS certificate serves DERP at `/derp` on its HTTPS listener (the endpoint WebSocket listener can share it) and STUN on UDP 3478. It advertises itself in its member object. Every Broker builds the same DERP map from membership: relay Brokers with the same configured `region_id` form one DERP region and mesh with each other using `derp_mesh_key`. Brokers without public reachability are DERP clients only. A Cluster needs at least one relay Broker. If all Brokers can reach each other directly over UDP, DERP is used only for rendezvous.
 - **Connections.** Peer RPC listens on TCP `[ula]:7946` inside the netstack. Links are opened lazily to any Broker that needs to be reached and closed after `link_idle` (2 min). Each link uses two TCP streams: one for messages (`Forward`) and one for RCR traffic, so that a handoff burst cannot hold up messages.
-- **Framing.** Length-prefixed protobuf frames (`internal/peerproto`) with a version byte in the stream preamble. Small RCR writes (stores, touches, presence updates) to the same Broker are coalesced into one frame. RPCs:
+- **Suspicion.** A peer becomes **suspect** locally when a dial fails or an RPC gets no reply within `rpc_timeout` (2s). Suspicion lasts 10s, doubling on each repeat up to 2 min, and clears on the first successful RPC.
+  - Suspect peers are skipped as write targets (§7.2) and queried last on reads.
+  - Suspicion never changes membership; S3 stays authoritative. It just gets traffic off a crashed Broker within seconds instead of the 60–90s S3 detection takes.
+  - When a link to a suspect peer recovers, its retry queues are flushed (§7.2).
+- **Framing.** Length-prefixed protobuf frames (`internal/peerproto`) with a version byte in the stream preamble. Small RCR writes to the same Broker are coalesced into one frame. All durations on the wire are **remaining milliseconds**, never absolute times. RPCs:
   - `Forward` / `ForwardResult`: messages (§9);
-  - `Store`, `Get`, `Touch`: records of each kind (§7);
+  - `Store`, `Get`, `Touch`, `Consume`: records of each kind (§7, §8);
   - `Watch` / `Notify`: presence changes (§9.4);
   - `Rejoin`, `Handoff`: membership changes (§4, §7.4).
 
@@ -124,10 +146,11 @@ Pin the `tailscale.com` module version. The packages used are internal-API-ish a
 
 ### 6.1 Transport
 
-- `wss://<broker>/v1/ws` with subprotocol `nimbo.v1`. TLS may terminate at a load balancer.
+- `wss://<broker>/v1/ws` with subprotocol `nimbo.v1`. TLS may terminate at a load balancer. If it does, the load balancer **must** pass the client address with PROXY protocol v2, which the Broker requires, because per-IP limits (§6.4) depend on it.
 - Every Action is one WebSocket **text** frame holding one JSON object. No binary frames in v1.
 - Keepalive uses WebSocket ping/pong; the broker pings every 20s. A session is dropped after 60s of silence.
 - Encodings: IDs, including cap IDs, and keys are unpadded lowercase base32.
+- **Reconnects.** SDKs reconnect with jittered exponential backoff (base 250ms, cap 30s) and honour `retry_after_ms` from `closing`. Brokers jitter `retry_after_ms` so that a draining or fenced Broker's endpoints spread out over time.
 
 ### 6.2 Handshake (endpoint authentication with X25519)
 
@@ -142,8 +165,8 @@ B → E  {"op":"welcome","session":"<id>","limits":{...},"brokers":["wss://..."]
 - `proof = HMAC-SHA256(key = SHA-256("nimbo/v1/auth" ‖ ss), msg = nonce ‖ authority ‖ E_pub ‖ B_eph_pub)`.
 - The Broker computes `X25519(B_eph_priv, E_pub)` and checks `proof`. It also checks that `authority` is one of its configured public names. This binding to the dialed host stops a malicious server from relaying a real Broker's challenge to a victim and replaying the answer. It works on ESP32 and other stacks that cannot reach TLS exporters.
 - The broker's ephemeral key is single-use and lives only for the handshake.
-- `welcome.brokers` suggests 2 other Broker URLs for redundancy: same region first, then the XOR-nearest to the endpoint key, which spreads endpoints evenly. Endpoints may connect to several Brokers with the same key.
-- A successful session writes an `Up` to the endpoint's presence record, and its close writes a `Down` (§9.1).
+- `welcome.brokers` suggests 2 other non-draining Broker URLs for redundancy: same region first, then the XOR-nearest to the endpoint key, which spreads endpoints evenly. Endpoints may connect to several Brokers with the same key.
+- A successful session, and its close, update the endpoint's presence register (§9.1).
 - Being connected grants nothing. A new Endpoint holds no caps. It can only mint caps to itself (§8.3), which grants nothing to anyone else until it transfers them.
 
 ### 6.3 Actions
@@ -152,26 +175,32 @@ Requests carry a client-chosen `rid`. Each gets exactly one `result`: `{"op":"re
 
 | Op (E → B) | Fields | Result |
 |---|---|---|
-| `send` (**SendMessage**) | `cap`, `payload` (JSON object), `caps` (cap IDs to carry, optional), `ttl_ms` (default 10000, max 60000), `reply` (optional: `schema`, `base`, `auto_reply`) | `msg` (message ID) and, if the target cap has `auto_reply`, `reply_id`: the lineage ID of the reply cap. Replies arrive as `deliver` with `on = reply_id`, which gives correlation without a per-request `base`. The result means the message was accepted for routing, not that it was delivered. |
-| `mint` (**MintCap**) | `schema` (optional JSON Schema), `base` (optional JSON object), `auto_reply` (bool) | `cap`: a new cap ID held by and targeting the caller. It is also the lineage ID that `deliver.on` reports for messages on this cap and its transferred copies. |
-| `transfer` (**TransferCap**) | `cap`, `to` (Endpoint key) | `cap`: a new cap ID bound to `to`, meaningful only to that Endpoint |
-| `renew` (**RenewCap**) | `caps` (array of cap IDs) | per-cap `{ok, deadline}`. The IDs do not change. |
-| `inspect` | `cap` | the record (with schema and base resolved) and current deadline (debugging and SDK convenience) |
+| `send` (**SendMessage**) | `cap`, `payload` (JSON object), `caps` (cap IDs to carry, optional), `ttl_ms` (default 10000, max 60000), `reply` (optional: `schema`, `base`, `auto_reply`) | `msg` (message ID) and, if the target cap has `auto_reply`, `reply_id`: the lineage ID of the single-use reply cap. Replies arrive as `deliver` with `on = reply_id`. The result means the message was accepted for routing, not that it was delivered. |
+| `mint` (**MintCap**) | `schema` (optional JSON Schema), `base` (optional JSON object), `auto_reply` (bool), `durable` (bool, optional) | `cap`: a new cap ID held by and targeting the caller. It is also the lineage ID that `deliver.on` reports for messages on this cap and its transferred copies. |
+| `transfer` (**TransferCap**) | `cap`, `to` (Endpoint key), `durable` (bool, optional) | `cap`: a new cap ID bound to `to`, meaningful only to that Endpoint. Transferring a single-use cap consumes it (§8.3). |
+| `renew` (**RenewCap**) | `caps` (array of cap IDs) | per-cap `{ok, ttl_ms}` or an error. The IDs do not change. |
+| `inspect` | `cap` | the record (with schema and base resolved) and remaining TTL (debugging and SDK convenience) |
+
+`durable: true` makes the call wait until at least one remote member of the placement set has acknowledged the new record. Without it the record can be lost if the issuing Broker crashes within milliseconds. Use it in bootstrap flows where the ID is handed out of band.
 
 | Op (B → E) | Fields |
 |---|---|
-| `deliver` | `msg`, `on` (lineage ID of the cap the message arrived on: the ID `mint` returned, or the sender's `reply_id`), `payload` (base fields merged in), `caps` (new cap IDs for the carried caps, now held by this Endpoint), `reply` (reply cap ID if auto-reply applies) |
-| `bounce` | `msg`, `reason` (`ttl_expired`, `receiver_busy`, `too_large`, `target_gone`). Best effort, and only to the sending session if it is still connected. |
-| `closing` | `reason`, `retry_after_ms` (drain on shutdown) |
+| `deliver` | `msg`, `on` (lineage ID of the cap the message arrived on: the ID `mint` returned, or the sender's `reply_id`), `payload` (base fields merged in), `caps` (new cap IDs for the carried caps, now held by this Endpoint), `reply` (single-use reply cap ID if auto-reply applies) |
+| `bounce` | `msg`, `reason` (`ttl_expired`, `receiver_busy`, `too_large`, `target_gone`, `unavailable`). Best effort, and only to the sending session if it is still connected. |
+| `closing` | `reason`, `retry_after_ms` (jittered) |
 
-Error codes: `bad_request`, `invalid_cap`, `not_holder`, `expired`, `target_gone`, `schema_violation`, `base_conflict`, `too_large`, `rate_limited`, `unavailable` (retryable).
+**Error codes:**
+- `bad_request`, `invalid_cap` (the placement set positively confirmed the cap does not exist), `not_holder`, `expired`, `consumed` (a single-use cap was already used), `target_gone`, `schema_violation`, `base_conflict`, `too_large`, `rate_limited`.
+- `unavailable` is retryable. It covers lookups that could not reach a quorum of answers, unresolvable blobs, overload, and a target whose state is unknown.
 
 ### 6.4 Limits (defaults, from `welcome.limits`)
 
 - **Messages:** payload ≤ 64 KiB, and no larger than the receiver's `max_message_bytes`. Up to 16 carried caps per message.
 - **Blobs:** schema ≤ 32 KiB, base ≤ 4 KiB. New blob bytes (a schema or base not already live in the Cluster) ≤ 64 KiB per session per 10s.
-- **Rates per session:** 1000 actions/s and 100 mints/s. 4096 distinct caps used or renewed per 10s. 100 lookups of unknown cap IDs per 10s (§10).
-- **Delivery queue per session:** 1000 messages or 1 MiB.
+- **Per session:** 1000 actions/s and 100 mints/s. 4096 distinct caps used or renewed per 10s. 100 lookups of unknown cap IDs per 10s. At most 10k live caps created by the session through mint or transfer, counted by the issuing Broker.
+- **Per client IP:** 64 concurrent sessions and 20 handshakes/s with a burst of 200, so a NAT'd fleet can reconnect after a Broker failure. Both are configurable, with an allowlist for known service networks.
+- **Per Broker:** a mint admission rate (default 20k records/s), and bounded per-peer replication queues. When either is exhausted, new mints, transfers and auto-reply sends fail with `unavailable`. Overload causes back-pressure, not unbounded memory.
+- **Queues:** the delivery queue is 1000 messages or 1 MiB per session. Held messages are capped at 100 per target per Broker.
 
 ---
 
@@ -179,57 +208,89 @@ Error codes: `bad_request`, `invalid_cap`, `not_holder`, `expired`, `target_gone
 
 All control state is a set of records. Each record lives on its **placement set**, a few Brokers chosen by XOR distance from its placement key. Nothing is gossiped and no Broker holds a full copy. Every Broker computes placement sets the same way, from S3 membership.
 
-### 7.1 Record kinds
+### 7.1 Placement
 
-| Kind | Placement key | Placement set | Content | Mutable state |
+- **Distance** from a key to a Broker is the minimum XOR distance from the key to any of that Broker's 16 virtual IDs.
+- **Placement set:** the 3 distinct, live, non-draining Brokers with the smallest distance.
+- **Balance:** at 100 Brokers the most loaded Broker holds about 1.3× the mean, against 2.1× without virtual IDs (simulated, review M4).
+- **Index:** Brokers keep the 1,600 virtual IDs in a sorted index, so a placement lookup is a few comparisons.
+
+| Kind | Placement key | Stored on | Content | Mutable state |
 |---|---|---|---|---|
-| **Cap** | `SHA-256(cap ID)` | issuing Broker + 2 nearest others | immutable cap record (§8.2), ~150 B | `deadline` |
-| **Presence** | `SHA-256(endpoint key)` | 3 nearest | live sessions `[(broker, incarnation, session, since)]`, `last_seen` | sessions, `last_seen` |
-| **Blob** | blob hash | 3 nearest | `kind` (schema/base), bytes | `deadline` |
+| **Cap** | `SHA-256(cap ID)` | placement set (3), plus a pinned cache copy on the issuer | immutable cap record (§8.2), ~150 B | `ttl` |
+| **Single-use cap** (reply caps and their transfers) | `SHA-256(cap ID)` | **issuer only**. The ID is chosen so the issuer is the nearest Broker (§8.3). | immutable cap record | `ttl`, `consumed` |
+| **Presence** | `SHA-256(endpoint key)` | placement set (3) | one register per (owner Broker, incarnation) (§9.1) | the register |
+| **Blob** | blob hash | placement set (3) | `kind` (schema/base), bytes | `ttl` |
 
-`replicas = 3` is a cluster-wide tunable. For caps, the issuer is always one of the holders because most uses happen on the Broker that created the cap, which then needs no network round trip.
+The issuer's pinned copy keeps uses on the creating Broker local, with no network round trip. That is the common case, since the creating Broker is usually the holder's own Broker.
 
 ### 7.2 Writes
 
-- **Async.** A Broker writing a record stores any local copy at once and sends `Store` to the other members of the placement set without waiting for acknowledgement, coalesced per link. No client-visible operation waits on replication.
-- **Merge.** Holders merge writes deterministically:
-  - cap and blob content is immutable, so the first write wins and later writes only raise `deadline` to the maximum;
-  - presence session sets are keyed by `(broker, incarnation, session)`. An `Up` adds a session, a `Down` removes it, and `last_seen` takes the maximum.
-
-  Merges are commutative and need no coordination, so there is no consensus.
+- **Acknowledged, asynchronous.** A Broker stores any local copy at once and sends `Store` (or `Touch`) to each placement-set member. No client-visible operation waits, except `durable` calls. Each peer has a bounded retry queue: entries are retried with backoff until acknowledged or the record expires. The queue is flushed when a link recovers.
+- **Fallback for unreachable members.** If a placement-set member is suspect, the write goes to the next-nearest non-suspect Broker as a **hinted** copy, tagged with the intended member. The hinted holder forwards it when that member recovers, and serves it to lookups meanwhile.
+- **Merge rules.** All are commutative, associative and idempotent, so no coordination is needed:
+  - **cap and blob content** is immutable, so the first write wins;
+  - **`ttl`:** each write carries remaining milliseconds, and the receiver converts it to its local deadline `min(now + ttl, now + cap_ttl)`, keeping the maximum. One Broker's clock error can therefore never extend a record cluster-wide;
+  - **`consumed`** is sticky: false → true only;
+  - **presence registers** are last-writer-wins per (endpoint, owner Broker, incarnation), ordered by the owner's sequence number (§9.1).
+- **Missing records.** A holder that receives a `Touch` for a key it does not have replies `missing`. The sender then re-sends the full record (or blob bytes) with `Store`. Every Broker that touches a record holds a copy, because it validated the record first.
 
 ### 7.3 Lookups
 
 1. **Local first:** records this Broker holds, then the local cache. The cache is an LRU of records received in a `Forward`, from earlier lookups, or created here.
-2. **Otherwise** send `Get` in parallel to the `lookup_fanout` (4) live Brokers nearest to the placement key. Asking one more than `replicas` covers a placement set that shifted in a recent membership change. Answers are merged with the same rules as writes.
-3. **On a miss,** retry with backoff for up to `lookup_wait` (1s). This covers a record that was used on another Broker before its asynchronous `Store` arrived.
+2. **Otherwise** send `Get` in parallel to the `lookup_fanout` (4) nearest live Brokers.
+   - Within `handoff_window` (10s) of a membership change, also ask the placement set under the previous view.
+   - Answers are merged with the write rules.
+   - Hinted holders answer too.
+3. **Outcome:**
+   - **found:** use the merged record;
+   - **not found:** at least 2 members of the current placement set answered "not found", and none is suspect. Only this produces `invalid_cap` or treats presence as empty;
+   - **anything else:** retry with backoff for up to `lookup_wait` (1s), which covers a record whose `Store` is still in flight. If that also fails, the result is `unavailable`, which is retryable.
 
-Blobs are immutable, so a cached blob is always valid. Cached cap records may hold a stale `deadline`, and cached presence may be stale. §8 and §9 say when each is re-read.
+Blobs are immutable, so a cached blob is always valid for its content. But the cache records the blob's TTL, so the "already live in the Cluster" check (§8.3) never trusts an expired cache entry. Cached cap records can hold a stale TTL, and cached presence can be stale. §8.4 and §9.2 say when each is re-read.
 
 ### 7.4 Handoff and restarts
 
-- **On any membership change** (a join, a leave, a member expiring, or a Rejoin with a new incarnation), every Broker recomputes the placement set of each record it holds. It pushes the record to any Broker that newly belongs in that set. A holder that is no longer in the set keeps the record as cache only.
-- **Presence is pushed by its owners.** A Broker also re-pushes the presence of its own live sessions whenever their placement set changes, and in full every `presence_reconcile` (5 min). The session-owning Broker is the source of truth for its sessions, so lost presence copies repair themselves.
-- **Restart.** A Broker that restarts with the same node key announces `Rejoin` with a new incarnation (§4). Its peers hand its share of records back to it, and its own sessions are re-registered as endpoints reconnect. There is no snapshot recovery, and nothing is persisted.
-- A record is lost only if every member of its placement set fails within one handoff window. A lost cap shows up as `invalid_cap` and the endpoint must be bootstrapped again. Lost presence is restored by its owner.
+- **On any membership change** (a join, a leave, a member expiring, a draining flag, or a Rejoin with a new incarnation), every Broker recomputes the placement set of each record it holds. It pushes the record, **including all mutable state** (`ttl`, `consumed`, registers), to any Broker that newly belongs in that set. A holder that is no longer in the set keeps the record as cache only.
+- **Presence is pushed by its owners.** A Broker re-pushes the registers for its own sessions:
+  - on any session change;
+  - whenever their placement set changes;
+  - after its own Rejoin;
+  - when a link to a holder recovers;
+  - and in full every `presence_reconcile` (5 min).
+
+  The owning Broker is the source of truth for its sessions, so lost or stale copies repair themselves.
+- **Restart.** A Broker that restarts with the same node key gets a new random incarnation and announces `Rejoin` (§4). Peers hand its share of records back to it. Registers from its previous incarnation turn into tombstones (§9.1). There is no snapshot recovery, and nothing is persisted.
+- A replicated record is lost only if every member of its placement set and every hinted holder fails within one handoff window. A lost cap shows up as `invalid_cap`. A single-use cap is lost with its issuer; the pending reply then fails, as with any at-most-once message.
 
 ### 7.5 Expiry (sliding)
 
-Cap and blob records have a `deadline` and use the same sliding rule:
+Cap and blob records carry a TTL and use the same sliding rule:
 
-- creating a record sets `deadline = now + cap_ttl` (60s);
-- a Broker that sees a use sets its local deadline to `now + cap_ttl`. Once it has extended that by at least `touch_threshold` (10s) since its last touch, it sends `Touch{key, deadline}` to the placement set, coalesced;
-- holders keep the maximum deadline and drop a record once `now > deadline + grace` (15s).
+- creating a record sets `ttl = cap_ttl` (60s);
+- a Broker that sees a use resets its local deadline to `now + cap_ttl`. Once it has extended that by at least `touch_threshold` (10s) since its last touch, it sends `Touch{key, ttl_ms}` to the placement set, acknowledged and coalesced;
+- holders keep a record until `deadline + grace + touch_threshold` (25s past their deadline). A holder's deadline can lag the true one by up to `touch_threshold`. The extra margin means holders never drop a record that some Broker would still accept (review H2b).
 
-This gives **soft expiry, 60–75s after the last use** as seen across the Cluster. A record used only within its first 10s sends no touches. Presence entries are dropped `cap_ttl + grace` after `last_seen` once they have no live sessions. Brokers need loosely synced clocks (NTP, under 1s skew), since deadlines are absolute unix-ms values.
+This gives **soft expiry**: a record is accepted until 60–75s after its last use, as seen across the Cluster. A record used only within its first 10s sends no touches. Presence registers follow their own retention (§9.1).
 
-### 7.6 Cost at the v1 target
+### 7.6 Why no anti-entropy is needed
 
-| | Per Broker (100 Brokers) | Cluster total |
+Every record either expires or is refreshed by its writer, and each refresh repairs missing copies:
+
+- A **cap or blob in use** is touched at least every ~10s by each Broker that uses it. Touches go to every placement-set member. A member that lost the record answers `missing` and gets a full re-store (§7.2). A record nobody uses expires within 75s.
+- A **presence register** is re-pushed by its owner on every change, placement shift, link recovery and every 5 minutes (§7.4).
+- **Single-use caps** are never replicated.
+
+After a partition heals, retry queues flush on link recovery, and the next touches and re-pushes restore full replication without a separate digest protocol. A long-lived record unused for longer than its TTL expires anyway.
+
+### 7.7 Cost at the v1 target
+
+| | Per Broker (100 Brokers; worst Broker ≈1.3× mean) | Cluster total |
 |---|---|---|
-| Presence for 1M endpoints | ~30k records, ~3 MB | 3 writes per connect or disconnect |
+| Presence for 1M endpoints | ~30k registers, ~3 MB | 3 writes per session change, plus 5-min reconcile (≈10k registers/s) |
 | 1M long-lived caps | ~30k records, ~5 MB | ~300k touches/s, coalesced into a few frames per link per 50ms |
-| New cap (mint, transfer, translation, reply) | — | 2 remote `Store`s of ~150 B |
+| New replicated cap (mint, transfer, translation) | — | 3 remote `Store`s of ~150 B |
+| Reply caps | issuer only, held until consumed or 60s | no replication traffic |
 | Distinct live blobs | 3% of them | bytes stored 3×, cached on use |
 
 ---
@@ -240,7 +301,7 @@ This gives **soft expiry, 60–75s after the last use** as seen across the Clust
 
 A cap token is **just its cap ID**: 16 random bytes, written as unpadded lowercase base32 (26 characters), for example `k3v7q2m9x4td8hj5wz6c1ry0ab`. It carries nothing else.
 
-The ID is not secret. What makes it usable only by its holder is the cap's record, which names the holder. A Broker accepts the ID only from a session authenticated as that holder. Each transfer creates a new ID for the new holder; the original ID stays valid for its own holder.
+The ID is not secret. What makes it usable only by its holder is the cap's record, which names the holder. A Broker accepts the ID only from a session authenticated as that holder. Each transfer creates a new ID for the new holder; the original ID stays valid for its own holder, unless the cap is single-use.
 
 ### 8.2 Cap record
 
@@ -250,39 +311,51 @@ The record is the immutable description of one cap, keyed by its ID and encoded 
 |---|---|---|
 | `lineage` | 16B | ID of the mint this cap descends from (`= id` for a minted cap). Reported to the target as `deliver.on`. |
 | `kind` | enum | `mint`, `transfer`, `reply` |
+| `single_use` | bool | Consumed by its first send. Set for reply caps and inherited on transfer. |
 | `target` | 32B | Endpoint key that receives Messages |
 | `holder` | 32B | Endpoint key allowed to use this cap |
-| `issuer` | 8B | Short ID of the Broker that created the record (a fixed member of its placement set) |
-| `minted_at` | unix ms | |
+| `issuer` | 8B | Short ID of the Broker that created the record |
+| `minted_at` | unix ms | informational |
 | `schema` | 32B? | blob hash of a JSON Schema (draft 2020-12) |
 | `base` | 32B? | blob hash of a JSON object |
-| `auto_reply` | bool | mint a reply cap on each delivery |
-| `hints` | [≤3]8B | Short IDs of Brokers where `target` was connected when `lineage` was minted. Routing tries them when presence is not yet known (§9.2). |
+| `auto_reply` | bool | create a single-use reply cap on each delivery |
+| `hints` | [≤3]8B | Short IDs of Brokers where `target` was connected when `lineage` was minted. Routing tries them when presence is unknown or empty (§9.2). |
 
 ### 8.3 Operations
 
-All of these happen on the Broker that receives the Action, which becomes the issuer of any new record. None of them wait on the network.
+All of these happen on the Broker that receives the Action, which becomes the issuer of any new record. None of them wait on the network, except with `durable`.
 
-- **MintCap.** Hashes the supplied schema and base. Compiles the schema, rejecting an invalid one. Writes any blob not already live in the Cluster to its placement set; a Broker skips the write if it stored or touched the same blob within the last `touch_threshold`. Creates `{kind: mint, target = holder = caller, lineage = id, hints = brokers the caller is connected to}`.
-- **TransferCap(cap, to).** Validates that the caller holds `cap`, counting it as a use (§8.5). Creates `{kind: transfer, holder = to}` with a new ID, copying target, schema, base, auto_reply, lineage and hints. It is **never** gated on whether `to` exists, is connected or is known, so it leaks nothing about `to`. The original cap stays valid. This is the out-of-band bootstrap path: an owner service transfers a cap to a sandbox's public key and hands the sandbox the returned ID, for example through an environment variable.
-- **Translation of carried caps** happens at the receive-side (egress) Broker (§9.3). It is the same as a transfer to the receiver, issued by the egress Broker.
-- **Reply caps.** When a Message is delivered on a cap with `auto_reply`, the egress Broker creates `{kind: reply, target = sender, holder = receiver, lineage = reply_id, hints = sender's brokers}`. `reply_id` is chosen at ingress and returned to the sender in the `send` result (§6.3), so the sender can match replies without any blob. Its `schema`, `base` and `auto_reply` come from the sender's `send.reply` options, each defaulting to none, none and `false`. The ingress Broker writes any reply schema or base blob, and the `Forward` carries only their hashes.
+- **MintCap.** Hashes the supplied schema and base. Compiles the schema, rejecting an invalid one. Writes any blob that is not already live: a Broker skips the write only if its cached TTL for that blob is still running. Creates `{kind: mint, target = holder = caller, lineage = id, hints = brokers the caller is connected to}`.
+- **TransferCap(cap, to).** Validates that the caller holds `cap`, counting it as a use (§8.5). Creates `{kind: transfer, holder = to}` with a new ID, copying target, single_use, schema, base, auto_reply, lineage and hints.
+  - It is **never** gated on whether `to` exists, is connected or is known, so it leaks nothing about `to`.
+  - The original cap stays valid, unless it is single-use: then the transfer **consumes** the original (§8.4), and the new cap is single-use too. A single-use cap therefore has move semantics.
+  - This is the out-of-band bootstrap path: an owner service transfers a cap to a sandbox's public key and hands the sandbox the returned ID, for example through an environment variable. Use `durable: true` here.
+- **Translation of carried caps** happens at the receive-side (egress) Broker (§9.3). It is the same as a transfer to the receiver, issued by the egress Broker. A carried single-use cap was already consumed at ingress, when it was validated.
+- **Reply caps.** When a Message is delivered on a cap with `auto_reply`, the egress Broker creates `{kind: reply, single_use: true, target = sender, holder = receiver, lineage = reply_id, hints = sender's brokers}`.
+  - `reply_id` is chosen at ingress and returned to the sender in the `send` result (§6.3), so the sender can match the reply without any blob.
+  - Its `schema`, `base` and `auto_reply` come from the sender's `send.reply` options, each defaulting to none, none and `false`. Setting `auto_reply` on the reply lets a conversation continue one single-use cap per turn.
+  - The ingress Broker writes any reply schema or base blob, and the `Forward` carries only their hashes.
+- **Single-use cap IDs and storage.** A single-use cap is stored only on its issuer and never replicated. Its ID is still 128 random bits, but drawn by **rejection sampling**: the issuer draws random IDs until it is itself the nearest Broker to `SHA-256(ID)`. That takes about 100 SHA-256 operations at 100 Brokers, around 30µs. Any Broker can then find it with an ordinary lookup (§7.3), and the issuer is the single place where consumption is decided. If membership has since shifted, the 4-way lookup fan-out still reaches the issuer.
 
-Schemas compiled from blobs are cached by hash. A unique `base` per mint costs one blob write per mint, which is why bases are small and new blob bytes have a per-session budget. Request/reply correlation uses `reply_id`, not a per-request base.
+Schemas compiled from blobs are cached by hash. A unique `base` per mint costs one blob write per mint, which is why bases are small and new blob bytes have a per-session budget.
 
 ### 8.4 Validation (at the ingress Broker, for every use)
 
 Given a cap ID presented by session `S`, authenticated as Endpoint key `K`:
 
-1. Look up the cap record (§7.3). If it is not found, fail with `invalid_cap`.
-2. Require `record.holder == K`, else `not_holder`.
-3. Require `now ≤ deadline + grace`. A cached copy can hold a stale deadline. If it looks expired, re-read the record from its placement set before rejecting with `expired`.
-4. Resolve the `schema` and `base` blobs: cache, then lookup.
-5. The target must not be gone (§9.1). If it is, fail with `target_gone`, and the use does not extend the deadline. This is how caps to departed ephemeral Endpoints die. It tells a holder whether its target is present, which the holder could already learn by sending.
+1. **Look up the record** (§7.3): `invalid_cap` on a positive not-found, `unavailable` if unresolved.
+2. **Check the holder:** `record.holder == K`, else `not_holder`.
+3. **Check the TTL.** It must not have expired. A cached copy can hold a stale TTL; if it looks expired, re-read the record from its placement set before rejecting with `expired`.
+4. **Resolve the `schema` and `base` blobs** (cache, then lookup). If a blob cannot be resolved, fail closed with `unavailable`.
+5. **Check the target's state** (§9.1):
+   - **gone:** fail with `target_gone`. The use does not extend the TTL; this is how caps to departed ephemeral Endpoints die;
+   - **unknown:** proceed, routing through hints or a watch;
+   - **present or recently absent:** proceed.
+6. **Consume a single-use cap.** Send `Consume{id}` to the issuer, or do it locally if this Broker is the issuer. The issuer atomically flips `consumed` and answers `ok`, or `consumed` if it was already used. Only `ok` proceeds. If the issuer cannot be reached, the result is `unavailable`, and the cap stays unconsumed.
 
 ### 8.5 Liveness
 
-**Rule.** A cap expires `cap_ttl` (60s) after its last **use**. A use is any of: SendMessage on it, carrying it in a Message, TransferCap of it, or RenewCap. RenewCap refreshes the deadline **without** issuing a new ID. Each cap ID has its own deadline; using a transferred copy does not extend its parent. A use of a cap is also a use of its schema and base blobs. The mechanism is §7.5.
+**Rule.** A cap expires `cap_ttl` (60s) after its last **use**. A use is any of: SendMessage on it, carrying it in a Message, TransferCap of it, or RenewCap. RenewCap refreshes the TTL **without** issuing a new ID; it does not consume a single-use cap. Each cap ID has its own TTL; using a transferred copy does not extend its parent. A use of a cap is also a use of its schema and base blobs. The mechanism is §7.5.
 
 **No revocation.** As decided, there is no RevokeCap. A cap in use lives indefinitely. An Endpoint withdraws access by disconnecting and rotating its ephemeral key, after which caps to it die with `target_gone`. Applications that need per-client withdrawal can mint one cap per client with a distinguishing `base` field and ignore messages from withdrawn clients.
 
@@ -292,42 +365,72 @@ Given a cap ID presented by session `S`, authenticated as Endpoint key `K`:
 
 ### 9.1 Presence
 
-Presence records answer "which Brokers is this Endpoint connected to right now?"
+Presence answers "which Brokers is this Endpoint connected to right now?"
 
-- **Writes.** A session opening sends `Up{key, broker, incarnation, session, since}` to the 3 Brokers nearest `SHA-256(key)`. A session closing sends `Down` and updates `last_seen`. Up and Down within the same 50ms window are coalesced.
-- **Validity.** No per-endpoint lease is needed. A session entry counts only while its Broker is a live member with that same incarnation. Entries from dead or restarted Brokers are ignored and pruned. The owning Broker re-pushes its sessions on placement changes and every 5 minutes (§7.4).
-- **Gone.** An Endpoint is **gone** when its presence record has no valid session and either its `last_seen` is more than `cap_ttl` ago or no record exists. Targets are always Endpoints that minted, so they were connected once. "No record" therefore means the target left more than 75s ago, or every copy was lost. A lost record is repaired by the owner's re-push if the endpoint is in fact still connected.
+- **Registers.** An endpoint's presence record is a set of **registers**, one per (owner Broker, incarnation). Each register holds `{seq, sessions[], absent_ttl}`:
+  - `seq` is the owner's monotonic sequence number;
+  - `sessions` are the owner's live sessions for this endpoint;
+  - when `sessions` is empty, `absent_ttl` is the time since the last one closed, sent as remaining milliseconds.
+
+  The owner always sends the **full** register, and holders keep the highest `seq`. This is a per-owner last-writer-wins CRDT: delayed, duplicated or handed-off writes cannot resurrect a closed session.
+- **Validity.** A register with sessions counts only while its owner is a live member with that incarnation.
+- **Pruning.** When an owner is declared dead or changes incarnation, holders turn its registers into **tombstones** with `absent since = prune time`. The endpoint therefore gets a full `cap_ttl` grace from the moment its Broker failed, not from some earlier time.
+- **Retention.** Tombstones are kept for `presence_tombstone_ttl` (10 min).
+- **Read repair.** An egress Broker that answers `not_here` re-pushes its own register for that endpoint, which corrects any stale view.
+
+An endpoint's state, as seen by a lookup:
+
+| State | Condition | Effect |
+|---|---|---|
+| **present** | some valid register has sessions | route to those Brokers |
+| **recently absent** | no sessions; latest absence started ≤ `cap_ttl` ago | hold the message and watch (§9.4); uses extend TTLs |
+| **gone** | no sessions; absent for more than `cap_ttl`, with at least one tombstone confirming it | `target_gone`; uses do not extend TTLs |
+| **unknown** | no registers found (positive not-found), or the lookup was unresolved | route through `hints`, then hold and watch; uses extend TTLs |
+
+"Gone" requires positive evidence that the endpoint has been absent continuously for `cap_ttl`. Missing or unreachable presence data never kills caps.
 
 ### 9.2 Ingress (sender's Broker)
 
-1. Validate the target cap (§8.4) and every carried cap. Carried caps must also be held by the sender. Each validated cap counts as a use (§8.5).
-2. The payload must be a JSON object. Validate it against the schema blob, if `record.schema` is set. The **base fields are not** covered by the schema.
-3. Merge the base blob into the payload shallowly. If the payload already has a top-level key that is in `base`, reject with `base_conflict`.
-4. Assign `msg` (16 random bytes), set `deadline = now + ttl_ms`, choose `reply_id` if the target cap has `auto_reply`, and reply `result{ok, msg, reply_id?}`.
-5. **Locate the target**, cheapest source first:
+1. **Sequence.** Sends are processed through a per-(session, target cap) sequencer: validation, routing and hand-off of message *n + 1* starts only after message *n* is handed off, held or dropped. Different caps on the same session proceed in parallel, so one cold lookup stalls only its own cap.
+2. **Validate** the target cap (§8.4) and every carried cap. Carried caps must also be held by the sender. Each validated cap counts as a use (§8.5).
+3. **Validate the payload.** It must be a JSON object. Validate it against the schema blob, if `record.schema` is set. The **base fields are not** covered by the schema.
+4. **Merge the base.** Merge the base blob into the payload shallowly. If the payload already has a top-level key that is in `base`, reject with `base_conflict`.
+5. **Accept.** Assign `msg` (16 random bytes), set the message TTL, choose `reply_id` if the target cap has `auto_reply`, and reply `result{ok, msg, reply_id?}`.
+6. **Locate the target**, cheapest source first:
    1. local sessions;
    2. the location cache (`key → brokers`, TTL 30s);
    3. a presence lookup (§7.3);
-   4. if presence returns nothing, `record.hints`. This covers a just-connected target whose `Up` has not landed yet.
+   4. if presence is empty or unknown, `record.hints`.
 
-   Among several Brokers, pick by rendezvous hash of `(cap ID, broker id)`. That keeps one sender's messages on one cap on one path, so they arrive FIFO.
-6. Send `Forward{msg, deadline, hop, target (cap ID + record), payload, carried[] (cap ID + record), reply_id, reply_opts (blob hashes + auto_reply), ingress}`. The records travel with the message. This is the fast path: the egress Broker does not look them up, caches them, and trusts the ingress Broker's validation.
-7. If the reply is `not_here`, nothing was delivered. Invalidate the cache entry, look up presence again, and retry. If the target is known but has no live session, wait for it (§9.4).
+   Among several Brokers, prefer non-suspect ones, then pick by rendezvous hash of `(cap ID, broker id)`, so one cap's messages follow one path.
+7. **Forward.** Send `Forward{msg, ttl_ms, hop, target (cap ID + record), payload, carried[] (cap ID + record), reply_id, reply_opts (blob hashes + auto_reply), ingress}`. The records travel with the message. This is the fast path: the egress Broker does not look them up, caches them, and trusts the ingress Broker's validation.
+8. **Outcomes:**
+   - **not sent** (dial failure, peer suspect): try the next candidate;
+   - **`not_here`:** invalidate the cache entry and look up presence again;
+   - **recently absent or unknown target:** hold the message and watch (§9.4).
+
+   At most 2 re-routes per message. After that it bounces with `unavailable`.
 
 ### 9.3 Egress (target's Broker)
 
-1. Pick the target's newest live session on this Broker. If there is none, answer `not_here`. If the target disconnected after the message was accepted, wait for it (§9.4).
-2. Translate each carried cap into a transfer to the receiver, and if `auto_reply` is set, create a reply cap (§8.3). These are local writes with asynchronous replication, so delivery does not wait on them.
-3. Write `deliver` to the session. Once written, the message is never re-sent anywhere.
+1. **Pick a session.** Use the target's newest live session on this Broker. If there is none, answer `not_here` and read-repair presence (§9.1). If the target disconnected after the message was accepted, hold it and watch (§9.4).
+2. **Create caps.** Translate each carried cap into a transfer to the receiver, and if `auto_reply` is set, create a single-use reply cap (§8.3). These are local writes, so delivery does not wait on them.
+3. **Deliver.** Write `deliver` to the session. Once written, the message is never re-sent anywhere.
 
 ### 9.4 Waiting for a reconnecting target
 
-A Broker holding a message for a target with a recent `last_seen` but no live session sends `Watch{key, until = message deadline}` to the target's presence set. Those Brokers reply `Notify` when an `Up` arrives, and the holder then re-routes. Watches expire with their deadline, so watch state is bounded by queued messages. Hop limit is 4. If the target is gone, or the TTL or queue limit is reached, a best-effort `bounce` goes back to the ingress Broker and on to the sending session.
+A Broker holding a message for a target that is recently absent or unknown sends `Watch{key, ttl_ms = message TTL}` to the presence set.
+
+- **Check-then-register.** Each holder registers the watch and replies with the endpoint's current registers in the same step. A reconnect that landed just before the watch is therefore seen at once.
+- **Notify.** Holders send `Notify` on the next register change, and the holding Broker then re-routes.
+- **Backstop.** The holding Broker also re-looks-up presence every 2s, in case a `Notify` is lost or lands under a different membership view.
+- **Bounds.** Watches expire with the message TTL. Held messages are capped at 100 per target per Broker (§6.4).
+- **Ending.** On TTL expiry, overflow or a gone target, a best-effort `bounce` goes back to the ingress Broker and on to the sending session.
 
 ### 9.5 Delivery semantics (decided: at-most-once + TTL)
 
-- **At most once.** A Broker hands a message to a peer only through `Forward`, and the peer replies `accepted`, `not_here` or `rejected(reason)`. `not_here` and `rejected` mean the peer did not take it, so retrying is safe. If the link fails before the reply, the outcome is unknown and the message is **dropped**, never re-sent.
-- **Ordering.** FIFO per (sender session, target cap) while the route is stable. No ordering across failover or across caps.
+- **At most once.** A message has exactly one owner at a time. Ownership moves only when a peer replies `accepted` to a `Forward`. `not_here` and `rejected` mean the peer did not take it. A `Forward` that was never written to the link can be retried safely. If a written `Forward` gets no reply, the outcome is unknown and the message is **dropped**, never re-sent. Egress never re-sends after writing to the WebSocket.
+- **Ordering.** FIFO per (sender session, target cap), as long as the target's set of Brokers is stable. The ingress sequencer (§9.2) and a single path per cap provide it, and held messages keep their place, because later messages on that cap wait behind them. No ordering is promised across caps, across sender sessions, or across a change in the target's Brokers.
 - **Delivery receipts** are not a protocol feature. They are built with reply caps.
 - **Backpressure.** Writes to the WebSocket rely on TCP backpressure. When the per-session queue is full, new messages bounce with `receiver_busy`.
 
@@ -340,13 +443,17 @@ The receiver gets `on` (which of its minted caps the message arrived on), the me
 ## 10. Security and abuse resistance
 
 - **Trust boundaries.** S3 write access means cluster admin. Brokers fully trust each other, including for RCR writes and lookups. Endpoints are untrusted. DERP relays and the network see only WireGuard ciphertext, protected by a PSK.
-- **Unforgeability.** A cap ID is usable only if its placement set holds a record for it. Only a Broker running Mint, Transfer, translation or reply-cap creation for an authenticated holder writes one. IDs are 128-bit random, so a made-up ID matches no record. Holder binding means a leaked ID is useless without the holder's private key. Blobs are content-addressed, so a schema or base cannot be substituted under a record.
+- **Unforgeability.** A cap ID is usable only if a record exists for it. Only a Broker running Mint, Transfer, translation or reply-cap creation for an authenticated holder writes one. IDs are 128-bit random, so a made-up ID matches no record. Holder binding means a leaked ID is useless without the holder's private key. Blobs are content-addressed, so a schema or base cannot be substituted under a record.
+- **Single use.** A single-use cap has exactly one arbiter, its issuer, and `consumed` only goes from false to true. It cannot be used twice, even when sent concurrently through different Brokers.
 - **No side channels on transfer.** TransferCap does not look at the recipient.
-- **Permissionless DoS.** Limits per IP on handshakes and per session on actions, mints, carried caps and bytes. Schema-compile limits: schema ≤ 32 KiB, no remote `$ref`, compile time capped.
-- **Touch amplification.** An endpoint could mint many caps and renew them to inflate touch traffic. The budget per session (4096 distinct caps per 10s) caps this; uses beyond the budget fail with `rate_limited`.
-- **Lookup amplification.** Each unknown cap ID costs up to 4 `Get` RPCs, retried for up to 1s. A per-session budget on unknown-ID lookups (100 per 10s) caps this.
-- **Blob amplification.** A fresh unique base on every mint would mean one blob write per mint. The new-blob budget per session (64 KiB per 10s) caps this.
-- **Presence churn.** Reconnect storms cost 3 coalesced writes per session event. A per-IP handshake rate limit bounds the rate.
+- **Clock safety.** Wire durations are relative and clamped to `cap_ttl` on receipt, and membership liveness is judged in S3 time. Brokers with bad clocks fence themselves (§4).
+- **Permissionless DoS.** The limits in §6.4 apply per IP (PROXY protocol behind load balancers), per session, per created-cap quota and per Broker. Schema compilation is capped: schema ≤ 32 KiB, no remote `$ref`, compile time limited.
+- **Amplification bounds:**
+  - **Touches:** 4096 distinct caps per session per 10s.
+  - **Lookups:** 100 unknown IDs per session per 10s.
+  - **Blobs:** 64 KiB of new bytes per session per 10s.
+  - **Fast-join S3 GETs:** negative cache plus a global rate limit.
+  - **Reconnect storms:** handshake buckets with burst, plus jittered `retry_after_ms`.
 - **Replay of handshake.** The broker's ephemeral key and the nonce are single-use, and the proof binds the dialed authority.
 - **Payload privacy.** Brokers see payloads in clear (they must validate schemas). End-to-end encryption is a future layer and could use the endpoint X25519 keys.
 
@@ -357,42 +464,55 @@ The receiver gets `on` (which of its minted caps the message arrived on), the me
 ```
 cmd/nimbod/                 main, flags, `nimbod init`, `nimbod run`, `nimbod keygen`, `nimbod ctl`
 internal/config/            config file + flags, cluster.json model
-internal/membership/        S3 member objects, poll/heartbeat, fast-join GET, Rejoin, change events
-internal/mesh/              magicsock + wireguard-go + netstack wiring, ULA addressing, peer dial/listen
+internal/membership/        S3 member objects, poll/heartbeat, freeze-on-failure, self-fencing,
+                            S3 clock offset, fast-join GET (+ negative cache), Rejoin, draining, change events
+internal/mesh/              magicsock + wireguard-go + netstack wiring, ULA addressing, peer dial/listen, suspicion
 internal/derpsrv/           embedded DERP server + STUN, DERP map from membership
-internal/peerproto/         protobuf messages + framing for broker↔broker, per-link write coalescing
-internal/rcr/               placement (XOR), record stores per kind, merge rules, Store/Get/Touch,
-                            lookup with fan-out, LRU caches, handoff, expiry sweeps
-internal/cap/               cap record codec (deterministic CBOR), mint/transfer/reply, validator
-internal/presence/          Up/Down, owner re-push, watches/notify, gone detection
+internal/peerproto/         protobuf messages + framing, per-link coalescing, acked retry queues
+internal/rcr/               virtual-ID placement index, record stores per kind, merge rules,
+                            Store/Get/Touch/missing, hinted copies, lookup outcomes, LRU caches, handoff, expiry
+internal/cap/               cap record codec (deterministic CBOR), mint/transfer/reply, ID rejection sampling,
+                            validator, Consume
+internal/presence/          per-owner LWW registers, tombstones, owner re-push, read repair, watches/notify,
+                            state classification
 internal/schema/            JSON Schema compile cache and validation
-internal/router/            ingress/egress, Forward, location cache, TTL queues, bounces, rendezvous
-internal/wsapi/             WebSocket server, handshake, Action codec, session lifecycle, limits
+internal/router/            ingress sequencer, egress, Forward, location cache, held messages, bounces
+internal/wsapi/             WebSocket server, PROXY protocol, handshake, Action codec, sessions, limits
 internal/metrics/           Prometheus, /debug endpoints, /healthz
-pkg/client/                 Go endpoint SDK (reference implementation of the protocol)
+pkg/client/                 Go endpoint SDK (reference implementation, incl. jittered reconnect)
 docs/protocol.md            endpoint wire protocol spec, for the ESP32 / Elixir SDKs
 ```
 
-**Dependencies:** `tailscale.com` (magicsock, wgengine/wireguard-go, netstack, derp), `github.com/coder/websocket`, `github.com/aws/aws-sdk-go-v2/service/s3`, `github.com/santhosh-tekuri/jsonschema/v6`, `github.com/fxamacker/cbor/v2`, `google.golang.org/protobuf`, `golang.org/x/crypto/curve25519`.
+**Dependencies:** `tailscale.com` (magicsock, wgengine/wireguard-go, netstack, derp), `github.com/coder/websocket`, `github.com/aws/aws-sdk-go-v2/service/s3`, `github.com/pires/go-proxyproto`, `github.com/santhosh-tekuri/jsonschema/v6`, `github.com/fxamacker/cbor/v2`, `google.golang.org/protobuf`, `golang.org/x/crypto/curve25519`.
 
-**Concurrency model:** one goroutine per session for reads and one for writes; sharded maps for record stores and caches; one coalescing writer per peer link and stream; a membership goroutine that publishes change events consumed by handoff.
+**Concurrency model:**
+- one goroutine per session for reads and one for writes;
+- per-(session, cap) sequencers;
+- sharded maps for record stores and caches;
+- one coalescing writer and one retry queue per peer link and stream;
+- a membership goroutine that publishes change events consumed by handoff.
 
-**Observability:** each Broker exposes Prometheus metrics and `/debug` endpoints for its own stores. `nimbod ctl` builds cluster-wide views by listing members from S3 and querying each Broker. No Broker holds a cluster-wide view.
+**Observability:** each Broker exposes Prometheus metrics for its stores, retry-queue depth, hinted copies, suspicion, S3 offset and fencing, plus `/debug` endpoints. `nimbod ctl` builds cluster-wide views by listing members from S3 and querying each Broker.
 
 **Testing:**
-- Unit tests for placement, merge rules, handoff, validation and expiry maths.
-- An in-process multi-broker harness with an in-memory S3 and an in-memory transport replacing the mesh.
-- Netem-based integration tests over the real mesh, covering partitions, DERP-only paths, restarts and churn.
-- Property tests: no message delivered twice; no cap accepted after 75s idle; after churn stops, every live record is on its placement set.
+- Unit tests for placement, merge rules (property tests that merges are commutative, associative and idempotent), handoff, validation, expiry and presence state classification.
+- An in-process multi-broker harness with an in-memory S3 and an in-memory transport. It includes fault injection: dropped and delayed frames, partitions, S3 errors, clock skew.
+- Netem-based integration tests over the real mesh.
+- Property tests:
+  - no message is delivered twice;
+  - no single-use cap is consumed twice;
+  - no cap is accepted after 75s idle (with bounded skew);
+  - after faults stop, every refreshed record is back on its full placement set within one refresh interval;
+  - a crashed Broker's endpoints, once reconnected elsewhere, keep all their caps.
 
 ---
 
 ## 12. Milestones
 
-1. **Single broker:** WebSocket API, handshake, mint/transfer/renew/send, cap records and expiry, blobs, reply caps, Go SDK. The RCR store runs with a membership of one.
-2. **Mesh + membership:** S3 membership, magicsock mesh, embedded DERP, Forward between Brokers.
-3. **Distributed RCR:** XOR placement, Store/Get/Touch, lookups, presence with watches, handoff, Rejoin.
-4. **Hardening:** limits and budgets, metrics and `nimbod ctl`, chaos and churn tests, protocol spec for third-party SDKs (ESP32 C, Elixir).
+1. **Single broker:** WebSocket API, handshake, mint/transfer/renew/send, cap records and expiry, single-use reply caps, blobs, Go SDK. The RCR store runs with a membership of one.
+2. **Mesh + membership:** S3 membership with the clock offset, freeze-on-failure and fencing; magicsock mesh with suspicion; embedded DERP; Forward between Brokers.
+3. **Distributed RCR:** virtual-ID placement; acked Store/Touch with retries, hinted copies and `missing`; lookups with outcomes; presence registers with watches and read repair; handoff; Rejoin; draining.
+4. **Hardening:** all limits and quotas, PROXY protocol, metrics and `nimbod ctl`, chaos and churn tests, protocol spec for third-party SDKs (ESP32 C, Elixir).
 
 ---
 
@@ -404,7 +524,7 @@ Decided with the project owner on 2026-10-12:
 |---|---|---|
 | D1 | Gossip peer selection (XOR-nearest alone partitions) | ~~N XOR-nearest plus ring successor/predecessor~~. Superseded by D14: there is no gossip. |
 | D2 | Capability lifetime beyond 1 minute | **Any use extends the deadline**, plus **RenewCap** that refreshes it without a new token |
-| D3 | Consistency of the sliding deadline | **Soft expiry**: touch at ≥10s extension, 15s grace (60–75s effective). Touches go to the record's placement set (D13, D14). |
+| D3 | Consistency of the sliding deadline | **Soft expiry**: touch at ≥10s extension, 15s grace (60–75s effective). Touches go to the record's placement set. |
 | D4 | Withdrawing access | **No revocation.** The target endpoint rotates its key. |
 | D5 | Delivery guarantee | **At-most-once + TTL** (default 10s, max 60s), FIFO per path, best-effort bounces |
 | D6 | DERP relays | **Embedded in `nimbod`**, DERP map built from S3 membership |
@@ -414,9 +534,14 @@ Decided with the project owner on 2026-10-12:
 | D10 | Broker node key source | **`NIMBOD_NODE_KEY` env var first**, then `--state-dir/node.key`, then a fresh key (§5) |
 | D11 | Rollup latency | ~~Burst allowance before 50ms batching~~. Superseded by D12: there is no rollup. |
 | D12 | Token format | **Just the random 128-bit cap ID** in base32. No record or Merkle proof in the token, and no Merkle roots. |
-| D13 | Where cap records live | **Issuer + 2 XOR-nearest replicas**, with handoff on membership change |
+| D13 | Where cap records live | ~~Issuer + 2 XOR-nearest replicas~~. Superseded by D16. |
 | D14 | Cluster-wide RCR propagation | **Removed.** No snapshot + WAL gossip. Endpoint presence lives on the **3 Brokers nearest `SHA-256(endpoint key)`**. Restart recovery is handoff. Metrics are per Broker. |
 | D15 | Where blobs live | **3 Brokers nearest the blob hash**, cached anywhere on use |
+| D16 | Cap placement (review M2) | **3 nearest by `SHA-256(cap ID)`**, with the issuer keeping a pinned cache copy |
+| D17 | Reply caps (review M3) | **Single-use.** Stored only on the issuer, which is the sole arbiter of consumption, and never replicated. Transfers of single-use caps consume them. |
+| D18 | Placement balance (review M4) | **16 virtual IDs per Broker** |
+| D19 | Anti-entropy (review H2) | **Not needed.** Every long-lived record is refreshed by its writer: touches with `missing` → re-store, and owner re-push for presence. Unrefreshed records expire. |
+| D20 | Other review findings | **Apply all** (C1, H1–H5, M1, M5–M8, L1–L3), as written in this revision |
 
 ## 14. Defaults open to change
 
@@ -425,17 +550,18 @@ These were chosen without the owner; each is easy to change.
 1. **Blob limits and budget:** schema ≤ 32 KiB, base ≤ 4 KiB, 64 KiB of new blob bytes per session per 10s.
 2. **`reply_id`** is returned by `send` so that replies can be correlated without a per-request base blob.
 3. **A base field collision rejects** the message (`base_conflict`) rather than letting the base silently overwrite the payload key.
-4. **Reply caps are ordinary caps**: reusable until idle for 60s, not single-use. The sender sets their schema, base and auto_reply.
-5. **Validation at ingress** (sender's Broker). Invalid traffic never crosses the mesh, and egress trusts ingress.
-6. **Asynchronous replication:** no client-visible operation waits for remote stores. A record used elsewhere within milliseconds of its creation is covered by `lookup_wait` retries.
-7. **Presence validity from membership and incarnation**, with owner re-push every 5 min, instead of per-endpoint leases.
-8. **Watches** at the presence set for messages waiting on a reconnecting target, instead of polling.
-9. **S3 timings:** heartbeat 15s, poll 30s, member TTL 60s, plus a fast-join GET on contact from an unknown key and a Rejoin announcement on start.
-10. **Tunables:** `replicas=3`, `lookup_fanout=4`, `lookup_wait=1s`, `cap_ttl=60s`, `touch_threshold=10s`, `grace=15s`, `presence_reconcile=5m`, location cache TTL 30s.
+4. **Validation at ingress** (sender's Broker). Invalid traffic never crosses the mesh, and egress trusts ingress.
+5. **Asynchronous, acknowledged replication** with retry queues and hinted copies. `durable` is opt-in.
+6. **Presence states** (present / recently absent / gone / unknown) and the 10-minute tombstone retention.
+7. **Single-use ID rejection sampling**, so the issuer is the nearest Broker. The alternative, encoding the issuer in the ID, would break D12.
+8. **Time:** S3 `Date` as the reference clock, `max_skew` = 3s, and relative TTLs on the wire.
+9. **S3 timings:** heartbeat 15s, poll 30s, member TTL 60s, fence at 45s without a heartbeat, fast-join GET with negative cache, Rejoin on start.
+10. **Tunables:** `replicas=3`, `virtual_ids=16`, `lookup_fanout=4`, `lookup_wait=1s`, `handoff_window=10s`, `rpc_timeout=2s`, `cap_ttl=60s`, `touch_threshold=10s`, `grace=15s`, `presence_reconcile=5m`, `presence_tombstone_ttl=10m`, location cache TTL 30s, max 2 re-routes per message.
+11. **Limits:** 64 sessions and 20 handshakes/s (burst 200) per IP; 10k live created caps per session; a 20k records/s mint admission rate per Broker; 100 held messages per target.
 
 ## 15. Future work
 
-- Plumtree-style or SWIM-style membership dissemination if S3 polling becomes the bottleneck past a few thousand Brokers.
+- SWIM-style membership dissemination if S3 polling becomes the bottleneck past a few thousand Brokers.
 - Optional end-to-end payload encryption using endpoint X25519 keys.
 - Attenuating transfers, where the transferrer adds base fields or tightens the schema.
-- Lazy replication for short-lived caps (e.g. replicate a reply cap only if it survives ~1s) to cut replication traffic under high message rates.
+- An opt-in `single_use` flag on MintCap for application-level one-shot grants.
