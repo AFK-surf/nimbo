@@ -125,6 +125,44 @@ jobs:
           NIMBO_DEVCLUSTER: ${{ runner.temp }}/nimbo-devcluster
         run: node test/workers.ts
 
+  typescript-browser:
+    # The same TypeScript tests in headless browsers through Playwright.
+    # Chromium loads the test page from an insecure context.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chromium, firefox, webkit]
+    name: typescript (${{ matrix.browser }})
+    defaults:
+      run:
+        working-directory: sdk/typescript
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: sdk/typescript/package-lock.json
+      - name: Build nimbo-devcluster
+        working-directory: .
+        run: go build -o "$RUNNER_TEMP/nimbo-devcluster" ./cmd/nimbo-devcluster
+      - run: npm ci
+      - name: Install ${{ matrix.browser }}
+        env:
+          BROWSER: ${{ matrix.browser }}
+        run: npx playwright install --with-deps "$BROWSER"
+      - run: npm run build
+      - name: Test in ${{ matrix.browser }}
+        env:
+          NIMBO_DEVCLUSTER: ${{ runner.temp }}/nimbo-devcluster
+          BROWSER: ${{ matrix.browser }}
+        run: node test/browser.ts "$BROWSER"
+
   dst:
     runs-on: ubuntu-latest
     # Pull requests and pushes run a small sweep (about 4 minutes in all);

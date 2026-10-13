@@ -40,11 +40,19 @@ export async function run(tests: Test[], ctx: Ctx, log: (line: string) => void =
       out(`ok   ${t.name} (${Date.now() - start}ms)`);
     } catch (err) {
       r.failed++;
-      out(`FAIL ${t.name}: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
+      out(`FAIL ${t.name}: ${describe(err)}`);
     }
   }
   out(`${r.passed} passed, ${r.failed} failed, ${r.skipped} skipped`);
   return r;
+}
+
+/** The stack, with the message first (Firefox's and Safari's stacks leave it out). */
+function describe(err: unknown): string {
+  if (!(err instanceof Error)) return String(err);
+  const head = String(err);
+  if (!err.stack) return head;
+  return err.stack.startsWith(head) ? err.stack : `${head}\n${err.stack}`;
 }
 
 function withTimeout<T>(p: Promise<T>, ms: number, name: string): Promise<T> {

@@ -117,7 +117,7 @@ func (h *Host) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		Subprotocols:       []string{wire.Subprotocol},
-		InsecureSkipVerify: true, // endpoints are not browsers; caps, not origins, grant authority
+		InsecureSkipVerify: true, // any Origin: endpoints may be browser pages; caps, not origins, grant authority
 	})
 	if err != nil {
 		return

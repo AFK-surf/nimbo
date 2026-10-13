@@ -1,6 +1,6 @@
 # @afk-surf/nimbo
 
-The TypeScript endpoint SDK for Nimbo. One ESM build runs unchanged in **Bun**, **Node ≥ 22** and **Cloudflare Workers**. It implements [docs/protocol.md](../../docs/protocol.md) with the same features as the Go SDK (`pkg/client`), plus `request`, `keepAlive` and `Delivery.respond`.
+The TypeScript endpoint SDK for Nimbo. One ESM build runs unchanged in **Bun**, **Node ≥ 22**, **Cloudflare Workers** and **browsers**. It implements [docs/protocol.md](../../docs/protocol.md) with the same features as the Go SDK (`pkg/client`), plus `request`, `keepAlive` and `Delivery.respond`.
 
 ```ts
 import { Client, generateKey } from "@afk-surf/nimbo";
@@ -110,7 +110,11 @@ export class Endpoint extends DurableObject<Env> {
 }
 ```
 
-The SDK uses only `WebSocket`, `crypto.subtle`, `crypto.getRandomValues` and timers. Data sockets set `binaryType = "arraybuffer"` and also accept `Blob` and Node `Buffer` messages, so `ws` and other implementations work too. X25519 comes from [`@noble/curves`](https://github.com/paulmillr/noble-curves), its only dependency.
+- **Browsers** (tested in Chromium, Firefox and WebKit): import the package through a bundler (esbuild, Vite, webpack, …); it needs no Node polyfills, and the page need not be a secure context. Two things to keep in mind:
+  - An `https://` page can only open `wss://` Broker URLs (browsers block mixed content).
+  - The endpoint's private key lives in the page. Keep it (`exportKey` / `importKey`) only where the page's own secrets belong, and remember that any script running on the page can use it.
+
+The SDK uses only `WebSocket`, `crypto.getRandomValues` and timers. Data sockets set `binaryType = "arraybuffer"` and also accept `Blob` and Node `Buffer` messages, so `ws` and other implementations work too. X25519, SHA-256 and HMAC come from [`@noble/curves`](https://github.com/paulmillr/noble-curves) and [`@noble/hashes`](https://github.com/paulmillr/noble-hashes), its only dependencies.
 
 ## Development
 
@@ -120,6 +124,7 @@ npm run build
 npm run typecheck
 npm test            # Node, Bun and workerd (needs Go, Bun)
 node test/node.ts   # or one runtime: bun test/node.ts, node test/workers.ts
+npm run test:browser  # headless Chromium, Firefox and WebKit (npx playwright install --with-deps first)
 ```
 
-The tests build and start [`cmd/nimbo-devcluster`](../../cmd/nimbo-devcluster), a 3-Broker cluster in one process with in-memory storage. Set `NIMBO_DEVCLUSTER` to the path of a prebuilt binary to skip the build. Unit tests run the client against an in-memory fake Broker (`test/fakebroker.ts`). The handshake proof is checked against the same vector as `pkg/wire/proof_test.go`. The workerd run uses Miniflare and lends the Worker the cluster's stop/start commands through a service binding.
+The tests build and start [`cmd/nimbo-devcluster`](../../cmd/nimbo-devcluster), a 3-Broker cluster in one process with in-memory storage. Set `NIMBO_DEVCLUSTER` to the path of a prebuilt binary to skip the build. Unit tests run the client against an in-memory fake Broker (`test/fakebroker.ts`). The handshake proof is checked against the same vector as `pkg/wire/proof_test.go`. The workerd run uses Miniflare and lends the Worker the cluster's stop/start commands through a service binding. The browser run (`test/browser.ts`) bundles the same tests into a page, drives it with Playwright and lends it those commands through an exposed function; Chromium loads the page from `http://nimbo.test`, which is not a secure context.
