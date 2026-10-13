@@ -47,8 +47,10 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: Unit, end-to-end (TCP mesh) and short simulation tests, with the race detector
-        run: go test -race -short -count=1 ./...
+      # The simulator is single-threaded, so the race detector adds nothing
+      # there and only multiplies its runtime; the dst job runs it.
+      - name: Unit and end-to-end (TCP mesh) tests, with the race detector
+        run: go test -race -short -count=1 -timeout 15m $(go list ./... | grep -v /internal/sim)
       - name: Build binaries
         run: go build ./cmd/...
 
