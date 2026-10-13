@@ -335,9 +335,13 @@ export const unitTests: Test[] = [
         client.on("deliver", deliveries.push);
         broker.handlers.send = (f, s) => {
           if (f.cap === "auto") {
-            // As a real Broker does, the result goes out before any reply can.
-            setTimeout(() => s.push({ op: "deliver", msg: "r1", on: "rid-1", payload: { answer: 42 } }), 0);
-            return { msg: "m", reply_id: "rid-1" };
+            // The result and the reply arrive in one task (a real Broker
+            // always sends the result first).
+            s.pushTogether(
+              { op: "result", rid: f.rid, ok: true, msg: "m", reply_id: "rid-1" },
+              { op: "deliver", msg: "r1", on: "rid-1", payload: { answer: 42 } },
+            );
+            return undefined;
           }
           if (f.cap === "slow") return { msg: "m", reply_id: "rid-2" };
           return { msg: "m" };

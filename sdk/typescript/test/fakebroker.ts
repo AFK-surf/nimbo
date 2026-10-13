@@ -134,6 +134,18 @@ export class FakeSocket implements WebSocketLike {
     later(() => this.emit("message", { data: JSON.stringify(f) }));
   }
 
+  /**
+   * Broker → client frames delivered in one task, with no microtask
+   * checkpoint between them, as Node's WebSocket does for frames that
+   * arrive in one read.
+   */
+  pushTogether(...fs: Frame[]): void {
+    if (this.closed) return;
+    later(() => {
+      for (const f of fs) this.emit("message", { data: JSON.stringify(f) });
+    });
+  }
+
   /** The Broker or the network ends the connection. */
   drop(code = 1006): void {
     if (this.closed) return;

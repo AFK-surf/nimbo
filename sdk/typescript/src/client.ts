@@ -71,6 +71,8 @@ interface Frame {
 interface Pending {
   resolve(frame: Frame): void;
   reject(err: unknown): void;
+  /** Runs synchronously when an ok result is handled, before any later frame. */
+  onOk?: ((frame: Frame) => void) | undefined;
 }
 
 /** A request waiting for a session, sent in order once one opens. */
@@ -212,6 +214,10 @@ export class Client {
    * the message was accepted for routing, not that it was delivered.
    */
   async send(cap: string, payload: JsonObject, options: SendOptions = {}): Promise<SendResult> {
+    return this.#send(cap, payload, options, undefined);
+  }
+
+  async #send(cap: string, payload: JsonObject, options: SendOptions, onOk: Pending["onOk"]): Promise<SendResult> {
     if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
       throw new TypeError("nimbo: payload must be a JSON object");
     }
@@ -223,6 +229,7 @@ export class Client {
     const r = await this.#request(
       { op: "send", cap, payload, caps: options.caps?.length ? options.caps : undefined, ttl_ms: options.ttlMs, reply },
       options.signal,
+      onOk,
     );
     return { msg: r.msg as string, replyId: r.reply_id as string | undefined };
   }
@@ -237,15 +244,25 @@ export class Client {
     payload: JsonObject,
     options: RequestOptions = {},
   ): Promise<Delivery<R>> {
-    const { replyId } = await this.send(cap, payload, options);
+    const waiter = deferred<Delivery>();
+    waiter.promise.catch(() => {}); // handled below; close() may reject it first
+    let replyId: string | undefined;
+    await this.#send(cap, payload, options, (f) => {
+      // The reply can be dispatched right after the result, before this
+      // function resumes (Node delivers frames from one read back to back),
+      // so the waiter is registered while the result is handled.
+      replyId = typeof f.reply_id === "string" && f.reply_id !== "" ? f.reply_id : undefined;
+      if (replyId) this.#replyWaiters.set(replyId, waiter);
+    });
     if (!replyId) throw new NimboError("no_reply", "the cap does not have auto_reply");
+    const id: string = replyId;
     const timeoutMs = options.timeoutMs ?? 30_000;
     const signal = options.signal;
     return new Promise<Delivery<R>>((resolve, reject) => {
       const done = () => {
         clearTimeout(timer);
         signal?.removeEventListener("abort", onAbort);
-        this.#replyWaiters.delete(replyId);
+        if (this.#replyWaiters.get(id) === waiter) this.#replyWaiters.delete(id);
       };
       const onAbort = () => {
         done();
@@ -257,16 +274,16 @@ export class Client {
       }, timeoutMs);
       if (signal?.aborted) return onAbort();
       signal?.addEventListener("abort", onAbort);
-      this.#replyWaiters.set(replyId, {
-        resolve: (d) => {
+      waiter.promise.then(
+        (d) => {
           done();
           resolve(d as Delivery<R>);
         },
-        reject: (err) => {
+        (err) => {
           done();
           reject(err);
         },
-      });
+      );
     });
   }
 
@@ -358,16 +375,16 @@ export class Client {
 
   // --- requests ---
 
-  #request(frame: Frame, signal: AbortSignal | undefined): Promise<Frame> {
+  #request(frame: Frame, signal: AbortSignal | undefined, onOk?: Pending["onOk"]): Promise<Frame> {
     return new Promise<Frame>((resolve, reject) => {
       if (this.#state === "closed") return reject(new ClientClosedError());
       if (signal?.aborted) return reject(signal.reason);
       const conn = this.#conn;
       if (conn?.open) {
-        this.#sendRequest(conn, frame, resolve, reject, signal);
+        this.#sendRequest(conn, frame, resolve, reject, signal, onOk);
         return;
       }
-      const q: Queued = { frame, resolve, reject, signal, onAbort: undefined };
+      const q: Queued = { frame, resolve, reject, onOk, signal, onAbort: undefined };
       if (signal) {
         q.onAbort = () => {
           const i = this.#queue.indexOf(q);
@@ -386,6 +403,7 @@ export class Client {
     resolve: (f: Frame) => void,
     reject: (err: unknown) => void,
     signal: AbortSignal | undefined,
+    onOk: Pending["onOk"],
   ): void {
     const rid = ++this.#rid;
     const onAbort = () => {
@@ -402,6 +420,7 @@ export class Client {
         cleanup();
         reject(e);
       },
+      onOk,
     });
     signal?.addEventListener("abort", onAbort, { once: true });
     try {
@@ -523,7 +542,7 @@ export class Client {
     // Send what queued up while disconnected, in order.
     for (const q of this.#queue.splice(0)) {
       if (q.onAbort) q.signal?.removeEventListener("abort", q.onAbort);
-      this.#sendRequest(conn, q.frame, q.resolve, q.reject, q.signal);
+      this.#sendRequest(conn, q.frame, q.resolve, q.reject, q.signal, q.onOk);
     }
     this.#emit("connect", { session: this.#session, limits: this.#limits, brokers: this.#brokers });
   }
@@ -537,6 +556,7 @@ export class Client {
         if (!conn || !p) return;
         conn.pending.delete(rid);
         if (f.ok) {
+          p.onOk?.(f);
           p.resolve(f);
         } else {
           const e = f.error as { code?: string; detail?: string } | undefined;
@@ -547,8 +567,12 @@ export class Client {
       case "deliver": {
         const d = this.#delivery(f);
         const waiter = this.#replyWaiters.get(d.on);
-        if (waiter) waiter.resolve(d);
-        else this.#emit("deliver", d);
+        if (waiter) {
+          this.#replyWaiters.delete(d.on);
+          waiter.resolve(d);
+        } else {
+          this.#emit("deliver", d);
+        }
         return;
       }
       case "bounce":
@@ -686,6 +710,16 @@ function toLimits(l: Record<string, number>): Limits {
     defaultTtlMs: l.default_ttl_ms ?? 0,
     maxTtlMs: l.max_ttl_ms ?? 0,
   };
+}
+
+function deferred<T>(): { promise: Promise<T>; resolve(v: T): void; reject(err: unknown): void } {
+  let resolve!: (v: T) => void;
+  let reject!: (err: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
 }
 
 /** A delay between d/2 and d, as the Go SDK does. */
