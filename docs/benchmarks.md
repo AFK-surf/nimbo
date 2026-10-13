@@ -59,19 +59,23 @@ At the v1 target, 10k sessions and 30k cap records per Broker come to well under
 
 `cmd/nimbo-bench` starts 3 Brokers in-process: real `host` runtime, real WebSocket listeners on loopback, an in-memory S3, and the chosen mesh. It drives them with `pkg/client` endpoints. Pairs are a sender on one Broker and a receiver on another (`-remote`, the default). 256-byte payloads.
 
-TCP mesh, 3 Brokers. These numbers were taken before the held-message fix of §5, but that fix does not change the steady-state path these scenarios measure:
+Both meshes, 3 Brokers, measured on an otherwise idle machine after the fixes of §5:
 
-| Scenario | Result |
-|---|---|
-| connect: 500 sessions, 64 concurrent | 2,266 sessions/s; handshake p50 21 ms, p99 76 ms (CPU-bound) |
-| mint / durable mint / durable transfer, sequential | p50 170 µs / 318 µs / 318 µs; p99 360 / 540 / 507 µs |
-| throughput: 32 pairs × 16 in flight | **~26–30k messages/s** delivered, 0 lost; latency under saturation p50 17 ms (Little's law: 512 in flight) |
-| open loop, 2,000 msgs/s | send→deliver **p50 0.75 ms, p99 1.7 ms, p99.9 3.9 ms** |
-| request/reply on single-use reply caps, 32 in flight | ~13k round trips/s; RTT p50 2.1 ms, p99 9 ms |
+| Scenario | TCP mesh | Tailscale mesh |
+|---|---|---|
+| connect: 500 sessions, 64 concurrent | 1,986 sessions/s; handshake p50 23 ms, p99 73 ms (CPU-bound) | 2,438 sessions/s; p50 19 ms, p99 57 ms |
+| mint, sequential | p50 173 µs, p99 311 µs | p50 174 µs, p99 554 µs |
+| durable mint, sequential | p50 249 µs, p99 440 µs | p50 367 µs, p99 760 µs (one outlier of 836 ms in 300) |
+| durable transfer, sequential | p50 290 µs, p99 559 µs | p50 443 µs, p99 740 µs |
+| throughput: 32 pairs × 16 in flight | **29.1k messages/s** delivered, 0 lost; latency under saturation p50 17 ms (Little's law: 512 in flight) | **22.9k messages/s**, 0 lost; p50 21 ms |
+| open loop, 2,000 msgs/s | send→deliver **p50 0.74 ms, p99 1.7 ms, p99.9 3.7 ms**; 100% delivered | **p50 0.52 ms, p99 2.2 ms, p99.9 8.8 ms**; 100% delivered |
+| request/reply on single-use reply caps, 32 in flight | **12.8k round trips/s**, 0 lost; RTT p50 2.2 ms, p99 9.0 ms | **8.9k round trips/s**, 0 lost; RTT p50 3.3 ms, p99 11.9 ms |
 
-Before the held-message fix, the same open-loop scenario lost 10–30% of messages (§5).
+No message was bounced, dropped or held in any scenario.
 
-The Tailscale mesh runs the same code over userspace WireGuard and gVisor netstack. It adds per-packet encryption and a userspace TCP stack, so expect lower throughput on the same cores. Run `nimbo-bench -mesh tailscale` to measure it. Its warm-up without a DERP relay takes 5–30 s while WireGuard paths form (see the design's DERP requirement).
+Userspace WireGuard and gVisor netstack cost about a fifth of the throughput on the same 4 cores, where clients, Brokers and the mesh all compete. Unloaded latency is no worse; the lower open-loop p50 on Tailscale is within run-to-run noise.
+
+The Tailscale cluster takes about 36 s to warm up. That is a property of the benchmark setup, which runs without a DERP relay; see §5, item 5.
 
 ## 4. Protocol cost at 100 Brokers (simulation)
 
@@ -123,6 +127,13 @@ With 6 Brokers and 24 endpoints the same workload costs 11 frames per delivered 
    - the host reconfigures the mesh synchronously on membership changes. The asynchronous update raced the first dial to a new Broker and made it suspect, which is what triggered the holds.
 
    After the fix the scenario delivers 100% with no bounces.
+4. **The distinct-caps quota dropped replies.** A session may use 4,096 distinct caps per 10 s, which bounds the Touches it can cause. Every reply goes out on a fresh single-use reply cap, so a responder hit the quota after about 410 replies/s, although its requester may create reply caps at the full action rate. The benchmark lost exactly one reply per pair every 4,096 requests, and each loss stalled its pair for the 5 s reply timeout (10.8k instead of 12.8k round trips/s).
+   - A send on a single-use cap consumes the cap instead of touching it, and such sends are bounded by the action rate. They are now exempt from the quota.
+   - Renew, inspect, transfer and carried caps still count.
+   - `nimbo-bench` now reports failed reply sends instead of ignoring them.
+5. **Without a DERP relay, a Broker started earlier cannot hear joiners until its next poll** (not fixed). The first Broker's S3 listing contains only itself. Joiners know it, but magicsock will not send a WireGuard handshake until a disco ping confirms a direct path, and the first Broker drops disco pings from keys it does not know. So no handshake arrives, `OnUnknownPeer` never fires, fast join never runs, and the joiners' Rejoins fail with `not sent`. The first Broker learns about the joiners only from its next 30 s member poll, which is the 36 s warm-up in §3.
+   - With a relay, as the design requires (at least one relay Broker per Cluster), the handshake goes through DERP and triggers fast join.
+   - No test exercises the DERP path end to end. The next step is to run `nimbo-bench` and the mesh tests with an embedded DERP relay.
 
 ## 6. Where the next gains are
 
