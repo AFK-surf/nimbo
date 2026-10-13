@@ -106,6 +106,9 @@ type World struct {
 	settledAt                               time.Duration
 	check                                   *Checker
 	nextEpIdx                               int
+	// stream data plane (stream.go)
+	nextLeg  node.StreamLeg
+	meshLegs []*simLeg // data connections, by their dialing end
 }
 
 type event struct {
@@ -217,6 +220,7 @@ func New(cfg Config) *World {
 	for i := 0; i < cfg.Endpoints; i++ {
 		w.addEndpoint(w.dur(5*time.Second, 10*time.Second))
 	}
+	w.After(5*time.Second, w.checkStreamDeadlines)
 	return w
 }
 
@@ -250,6 +254,11 @@ type Stats struct {
 	PeerFrames, PeerBytes, RCROps map[string]int
 	S3Ops                         map[string]int
 	Sessions                      int // sessions established
+	// Streams.
+	StreamsOpened, StreamOffers, StreamsAccepted, StreamsFailed int
+	StreamAttaches, StreamAttachOK, StreamDials, StreamMsgs     int
+	StreamCloses, StreamLost                                    int
+	StreamsExpected, StreamsExpectedOK                          int
 }
 
 func (r *Result) String() string {
@@ -261,6 +270,8 @@ func (r *Result) String() string {
 	fmt.Fprintf(&b, "  quiet-phase expected=%d ok=%d delivered=%d\n", s.Expected, s.ExpectedOK, s.ExpectedDelivered)
 	fmt.Fprintf(&b, "  faults: crashes=%d partitions=%d s3outages=%d skews=%d drains=%d rotations=%d churns=%d linkresets=%d\n",
 		s.Crashes, s.Partitions, s.S3Outages, s.Skews, s.Drains, s.Rotations, s.Churns, s.LinkResets)
+	fmt.Fprintf(&b, "  streams: opened=%d offers=%d accepted=%d failed=%d attaches=%d/%d dials=%d msgs=%d closes=%d lost=%d quiet-phase=%d/%d\n",
+		s.StreamsOpened, s.StreamOffers, s.StreamsAccepted, s.StreamsFailed, s.StreamAttachOK, s.StreamAttaches, s.StreamDials, s.StreamMsgs, s.StreamCloses, s.StreamLost, s.StreamsExpectedOK, s.StreamsExpected)
 	fmt.Fprintf(&b, "  brokers: delivered=%d forwarded=%d hinted=%d\n", s.BrokerDelivered, s.BrokerForwarded, s.BrokerHinted)
 	fmt.Fprintf(&b, "  errors: %v\n", s.Errors)
 	for _, v := range r.Violations {

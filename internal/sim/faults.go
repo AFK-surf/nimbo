@@ -82,6 +82,7 @@ func (w *World) faultLinkReset() {
 	if a != b {
 		w.check.stats.LinkResets++
 		w.resetLink(a, b)
+		w.breakMesh(w.brokers[a], w.brokers[b])
 	}
 }
 

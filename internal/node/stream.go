@@ -502,6 +502,8 @@ type StreamInfo struct {
 	Paired   bool
 	Spliced  bool
 	Deadline time.Time
+	// Late is how far past its deadline the half is (negative: before).
+	Late time.Duration
 }
 
 // PendingStreams lists the half-streams that are not yet spliced.
@@ -509,7 +511,7 @@ func (n *Node) PendingStreams() []StreamInfo {
 	var out []StreamInfo
 	for _, m := range []map[ids.MsgID]*halfStream{n.holders, n.targets} {
 		for _, h := range m {
-			out = append(out, StreamInfo{ID: h.id, Holder: h.side == sideHolder, Paired: h.paired, Spliced: h.spliced, Deadline: h.deadline})
+			out = append(out, StreamInfo{ID: h.id, Holder: h.side == sideHolder, Paired: h.paired, Spliced: h.spliced, Deadline: h.deadline, Late: n.now().Sub(h.deadline)})
 		}
 	}
 	return out
