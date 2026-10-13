@@ -3,6 +3,8 @@
 // hello proof with its own X25519 and HMAC.
 
 import { x25519 } from "@noble/curves/ed25519.js";
+import { hmac } from "@noble/hashes/hmac.js";
+import { sha256 } from "@noble/hashes/sha2.js";
 import { decodeBase32, encodeBase32 } from "../dist/index.js";
 import type { WebSocketConstructor, WebSocketLike } from "../dist/index.js";
 
@@ -158,7 +160,13 @@ export class FakeSocket implements WebSocketLike {
     later(() => this.emit("close", { code, reason }));
   }
 
-  close(code = 1000, reason = ""): void {
+  close(code?: number, reason = ""): void {
+    // As a WHATWG WebSocket (browsers, Node, Bun, Workers) checks them.
+    if (code !== undefined && code !== 1000 && (code < 3000 || code > 4999)) {
+      throw new DOMException(`close code ${code} is neither 1000 nor in 3000-4999`, "InvalidAccessError");
+    }
+    if (new TextEncoder().encode(reason).length > 123) throw new DOMException("close reason over 123 bytes", "SyntaxError");
+    code ??= reason ? 1000 : 1005;
     if (this.closed) return;
     this.closed = true;
     this.closeCode = code;
@@ -199,15 +207,15 @@ function later(f: () => void): void {
   setTimeout(f, 0);
 }
 
+// @noble/hashes rather than crypto.subtle, which a page that is not a secure
+// context lacks (test/browser.ts runs Chromium on one).
 async function proof(ss: Uint8Array, nonce: Uint8Array, authority: string, ePub: Uint8Array, bEph: Uint8Array) {
   const enc = new TextEncoder();
-  const subtle = globalThis.crypto.subtle;
-  const k = await subtle.digest("SHA-256", cat(enc.encode("nimbo/v1/auth"), ss));
-  const hk = await subtle.importKey("raw", k, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-  return new Uint8Array(await subtle.sign("HMAC", hk, cat(nonce, enc.encode(authority), ePub, bEph)));
+  const k = sha256(cat(enc.encode("nimbo/v1/auth"), ss));
+  return hmac(sha256, k, cat(nonce, enc.encode(authority), ePub, bEph));
 }
 
-function cat(...ps: Uint8Array[]): Uint8Array<ArrayBuffer> {
+function cat(...ps: Uint8Array[]): Uint8Array {
   const out = new Uint8Array(ps.reduce((n, p) => n + p.length, 0));
   let o = 0;
   for (const p of ps) {

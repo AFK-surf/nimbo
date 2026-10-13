@@ -544,7 +544,7 @@ export class Client {
       if (conn.ended) return;
       if (typeof ev.data !== "string") {
         failure = new Error("nimbo: unexpected binary frame");
-        ws.close(1003, "binary frames are not part of nimbo.v1");
+        closeWith(ws, 1003, "binary frames are not part of nimbo.v1");
         return;
       }
       let f: Frame;
@@ -552,7 +552,7 @@ export class Client {
         f = JSON.parse(ev.data) as Frame;
       } catch {
         failure = new Error("nimbo: malformed frame from Broker");
-        ws.close(1002, "malformed frame");
+        closeWith(ws, 1002, "malformed frame");
         return;
       }
       if (f.op === "closing") {
@@ -567,7 +567,7 @@ export class Client {
         handshake = "hello";
         void this.#hello(conn, f).catch((err) => {
           failure = toError(err);
-          ws.close(1002, "bad challenge");
+          closeWith(ws, 1002, "bad challenge");
         });
         return;
       }
@@ -577,7 +577,7 @@ export class Client {
         return;
       }
       failure = new Error(`nimbo: unexpected ${String(f.op)} during handshake`);
-      ws.close(1002, "unexpected frame");
+      closeWith(ws, 1002, "unexpected frame");
     });
     ws.addEventListener("error", (ev) => {
       failure ??= new Error(`nimbo: websocket error${describe(ev)}`);
@@ -843,6 +843,23 @@ function describe(ev: unknown): string {
   const e = ev as { message?: unknown; error?: unknown } | undefined;
   const m = e?.message ?? (e?.error instanceof Error ? e.error.message : undefined);
   return typeof m === "string" && m ? `: ${m}` : "";
+}
+
+/**
+ * Closes with a protocol-error code where the implementation allows it.
+ * WHATWG WebSockets (browsers, Node, Bun, Workers) accept only 1000 and
+ * 3000–4999 and throw on others; they then close without a code.
+ */
+function closeWith(ws: WebSocketLike, code: number, reason: string): void {
+  try {
+    ws.close(code, reason);
+  } catch {
+    try {
+      ws.close();
+    } catch {
+      // already closed
+    }
+  }
 }
 
 /** Lets Node and Bun exit while only the renew timer is pending; a no-op elsewhere. */

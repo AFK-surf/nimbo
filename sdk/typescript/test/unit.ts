@@ -239,6 +239,36 @@ export const unitTests: Test[] = [
     },
   },
   {
+    name: "a malformed, binary or out-of-order frame ends the connection and is retried",
+    async fn() {
+      const cases: [string, (b: FakeBroker) => void, string][] = [
+        ["malformed", (b) => b.last.pushData("{not json"), "malformed frame"],
+        ["binary", (b) => b.last.pushData(new ArrayBuffer(4)), "unexpected binary frame"],
+        ["out of order", (b) => b.last.push({ op: "result", rid: 1, ok: true }), "unexpected result during handshake"],
+      ];
+      for (const [what, push, want] of cases) {
+        const broker = new FakeBroker();
+        if (what === "out of order") broker.mode = "silent";
+        const { client } = fake({ WebSocket: broker.WebSocket });
+        try {
+          if (what !== "out of order") await opened(client);
+          else await until(() => broker.sockets.length === 1, "an attempt");
+          const d = new Promise<DisconnectEvent>((r) => client.on("disconnect", r));
+          push(broker);
+          // The close codes the protocol names (1002, 1003) throw in WHATWG
+          // WebSockets, so the socket closes without one.
+          const ev = await d;
+          assert(ev.error?.message.includes(want), `${what}: got ${String(ev.error)}`);
+          assert(broker.sockets[0]!.closed, `${what}: socket closed`);
+          broker.mode = "ok";
+          await until(() => broker.sockets.length >= 2, `${what}: a second attempt`);
+        } finally {
+          client.close();
+        }
+      }
+    },
+  },
+  {
     name: "errors carry the Broker's code",
     async fn() {
       const { broker, client } = fake();

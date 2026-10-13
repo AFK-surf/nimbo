@@ -18,7 +18,7 @@ Read [docs/design.md](docs/design.md) for the design, [docs/protocol.md](docs/pr
 | `internal/mesh` | Tailscale data-plane mesh; TCP development mesh |
 | `internal/s3store` | S3 (aws-sdk-go-v2) and in-memory stores |
 | `pkg/client`, `pkg/wire` | Go endpoint SDK and protocol types |
-| `sdk/typescript` | TypeScript endpoint SDK for Bun, Node and Cloudflare Workers |
+| `sdk/typescript` | TypeScript endpoint SDK for Bun, Node, Cloudflare Workers and browsers |
 | `cmd/nimbod` | the Broker binary |
 | `cmd/nimbo-devcluster` | a local in-memory cluster for SDK development and tests |
 
@@ -55,7 +55,7 @@ st.Write(ctx, websocket.MessageBinary, data) // st.Read, st.Reader/Writer, st.Ne
 
 ## Using it from TypeScript
 
-[`sdk/typescript`](sdk/typescript) runs in Bun, Node ≥ 22 and Cloudflare Workers. The client connects and reconnects in the background:
+[`sdk/typescript`](sdk/typescript) runs in Bun, Node ≥ 22, Cloudflare Workers and browsers. The client connects and reconnects in the background:
 
 ```ts
 const client = new Client({ url: "wss://broker1.example.com/v1/ws", key: generateKey() });
