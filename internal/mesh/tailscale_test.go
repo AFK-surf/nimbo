@@ -6,12 +6,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/netip"
 	"sync"
 	"testing"
 	"time"
 
 	"golang.org/x/crypto/curve25519"
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
 
 	"github.com/afk-surf/nimbo/internal/ids"
@@ -148,6 +150,7 @@ func TestTSMeshLoopback(t *testing.T) {
 			if got := <-done; got != "ping!" {
 				t.Fatalf("server got %q", got)
 			}
+			waitPath(t, a, b, "direct")
 			return
 		}
 	}
@@ -216,9 +219,65 @@ func TestTSMeshThroughPublishedRelays(t *testing.T) {
 		_, err = io.ReadFull(c, buf)
 		c.Close()
 		if err == nil && string(buf) == "ping!" {
+			mp := waitPath(t, b, a, "derp")
+			if code := dm.Regions[1].RegionCode; mp.DERP != code {
+				t.Errorf("DERP = %q, want %q (a's home)", mp.DERP, code)
+			}
 			return
 		}
 		lastErr = err
 	}
 	t.Fatalf("no connection through the published relays: %v", lastErr)
+}
+
+// waitPath waits for from's /debug/stats view of to to report path, and
+// checks the ping it then measures.
+func waitPath(t *testing.T, from, to *tsNode, path string) node.MeshPeer {
+	t.Helper()
+	var mp node.MeshPeer
+	for deadline := time.Now().Add(15 * time.Second); time.Now().Before(deadline); time.Sleep(200 * time.Millisecond) {
+		ps := from.ts.PeerPaths(0)
+		if len(ps) != 1 || ps[0].ID != to.id.String() {
+			t.Fatalf("PeerPaths = %+v, want just %s", ps, to.id.Abbrev())
+		}
+		if mp = ps[0]; mp.Path == path && mp.LastHandshake != nil {
+			break
+		}
+	}
+	if mp.Path != path || mp.LastHandshake == nil || mp.TxBytes == 0 {
+		t.Fatalf("PeerPaths: %+v, want path %s with a handshake", mp, path)
+	}
+	if path == "direct" && mp.Addr == "" {
+		t.Errorf("direct path without an address: %+v", mp)
+	}
+	ps := from.ts.PeerPaths(5 * time.Second)
+	if p := ps[0]; p.LatencyMs == nil || p.PingErr != "" {
+		t.Errorf("ping: %+v", p)
+	}
+	return mp
+}
+
+func TestFillPeer(t *testing.T) {
+	now := time.Now()
+	for _, tc := range []struct {
+		ps   ipnstate.PeerStatus
+		path string
+		addr string
+	}{
+		{ipnstate.PeerStatus{Relay: "ams"}, "idle", ""},
+		{ipnstate.PeerStatus{Relay: "ams", Active: true, LastWrite: now}, "derp", ""},
+		{ipnstate.PeerStatus{Relay: "ams", Active: true, CurAddr: "[fdaa::1]:41641"}, "direct", "[fdaa::1]:41641"},
+		{ipnstate.PeerStatus{Active: true, PeerRelay: "1.2.3.4:5:vni:6"}, "peer-relay", "1.2.3.4:5:vni:6"},
+	} {
+		mp := node.MeshPeer{Path: "idle"}
+		fillPeer(&mp, &tc.ps)
+		if mp.Path != tc.path || mp.Addr != tc.addr || mp.DERP != tc.ps.Relay {
+			t.Errorf("fillPeer(%+v) = %+v", tc.ps, mp)
+		}
+	}
+	var mp node.MeshPeer
+	fillPing(&mp, &ipnstate.PingResult{LatencySeconds: 0.105, DERPRegionID: 4})
+	if mp.PingPath != "derp" || mp.LatencyMs == nil || math.Abs(*mp.LatencyMs-105) > 1e-9 {
+		t.Errorf("fillPing derp: %+v", mp)
+	}
 }
