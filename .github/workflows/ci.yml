@@ -85,6 +85,46 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: GOOS="${TARGET%/*}" GOARCH="${TARGET#*/}" go build ./...
 
+  typescript:
+    # The TypeScript SDK: unit and end-to-end tests (against
+    # cmd/nimbo-devcluster) in Node, Bun and workerd.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: sdk/typescript
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: sdk/typescript/package-lock.json
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: Build nimbo-devcluster
+        working-directory: .
+        run: go build -o "$RUNNER_TEMP/nimbo-devcluster" ./cmd/nimbo-devcluster
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+      - name: Node
+        env:
+          NIMBO_DEVCLUSTER: ${{ runner.temp }}/nimbo-devcluster
+        run: node test/node.ts
+      - name: Bun
+        env:
+          NIMBO_DEVCLUSTER: ${{ runner.temp }}/nimbo-devcluster
+        run: bun test/node.ts
+      - name: Cloudflare Workers (workerd)
+        env:
+          NIMBO_DEVCLUSTER: ${{ runner.temp }}/nimbo-devcluster
+        run: node test/workers.ts
+
   dst:
     runs-on: ubuntu-latest
     # Pull requests and pushes run a small sweep (about 4 minutes in all);

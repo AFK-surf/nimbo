@@ -18,7 +18,9 @@ Read [docs/design.md](docs/design.md) for the design, [docs/protocol.md](docs/pr
 | `internal/mesh` | Tailscale data-plane mesh; TCP development mesh |
 | `internal/s3store` | S3 (aws-sdk-go-v2) and in-memory stores |
 | `pkg/client`, `pkg/wire` | Go endpoint SDK and protocol types |
+| `sdk/typescript` | TypeScript endpoint SDK for Bun, Node and Cloudflare Workers |
 | `cmd/nimbod` | the Broker binary |
+| `cmd/nimbo-devcluster` | a local in-memory cluster for SDK development and tests |
 
 ## Running
 
@@ -51,6 +53,21 @@ st, _ := holder.OpenStream(ctx, granted, client.StreamOptions{Payload: map[strin
 st.Write(ctx, websocket.MessageBinary, data) // st.Read, st.Reader/Writer, st.NetConn, st.Close(code, reason)
 ```
 
+## Using it from TypeScript
+
+[`sdk/typescript`](sdk/typescript) runs in Bun, Node ≥ 22 and Cloudflare Workers. The client connects and reconnects in the background:
+
+```ts
+const client = new Client({ url: "wss://broker1.example.com/v1/ws", key: generateKey() });
+client.on("deliver", (d) => { /* d.on, d.payload, d.respond(...) */ });
+const cap = await client.mint({ autoReply: true });
+const granted = await client.transfer(cap, otherEndpointKey, { durable: true });
+```
+
+The TypeScript SDK does not open or accept streams yet; it sees a stream offer as an ordinary delivery, and an offer it ignores times out on the holder's side.
+
+For SDK development, `go run ./cmd/nimbo-devcluster` starts a 3-Broker cluster on loopback with in-memory storage and prints its URLs.
+
 ## Testing
 
 ```sh
@@ -61,4 +78,4 @@ go run ./cmd/nimbo-sim -n 500  # 500 random fault schedules
 
 Requires Go 1.27.1 (pinned by the `tailscale.com` module).
 
-CI (`.github/workflows/ci.yml`) runs gofmt, vet and a tidy check; all tests except the (single-threaded) simulator with the race detector; the Tailscale-mesh end-to-end tests; builds with cgo disabled for linux/amd64, linux/arm64, darwin/arm64, openbsd/amd64, openbsd/arm64 and windows/amd64; and the simulation scenarios plus 16 random fault schedules on fresh seeds each run, which keeps the job to about 4 minutes. A nightly run sweeps 400 seeds plus 100 at a 3× fault rate, and a manual run takes any number (`seeds` input). A failing seed is printed and replays exactly with `go run ./cmd/nimbo-sim -seed N -n 1 -v`.
+CI (`.github/workflows/ci.yml`) runs gofmt, vet and a tidy check; the TypeScript SDK's tests in Node, Bun and workerd; all tests except the (single-threaded) simulator with the race detector; the Tailscale-mesh end-to-end tests; builds with cgo disabled for linux/amd64, linux/arm64, darwin/arm64, openbsd/amd64, openbsd/arm64 and windows/amd64; and the simulation scenarios plus 16 random fault schedules on fresh seeds each run, which keeps the job to about 4 minutes. A nightly run sweeps 400 seeds plus 100 at a 3× fault rate, and a manual run takes any number (`seeds` input). A failing seed is printed and replays exactly with `go run ./cmd/nimbo-sim -seed N -n 1 -v`.

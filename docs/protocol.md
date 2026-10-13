@@ -1,6 +1,6 @@
 # Nimbo endpoint protocol (v1)
 
-This is the wire protocol between an **Endpoint** and a **Broker** (`nimbod`). It is everything a third-party SDK (ESP32 C, Elixir, …) needs. It requires only X25519, HMAC-SHA256, SHA-256, JSON and WebSocket. The Go SDK in `pkg/client` is the reference implementation; the frame types are in `pkg/wire`.
+This is the wire protocol between an **Endpoint** and a **Broker** (`nimbod`). It is everything a third-party SDK (ESP32 C, Elixir, …) needs. It requires only X25519, HMAC-SHA256, SHA-256, JSON and WebSocket. The Go SDK in `pkg/client` is the reference implementation; the frame types are in `pkg/wire`. `sdk/typescript` is a second implementation, and `pkg/wire/proof_test.go` pins a handshake test vector for new ones.
 
 ## 1. Transport
 
