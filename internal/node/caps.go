@@ -63,12 +63,12 @@ func (n *Node) writeBlob(kind peerproto.BlobKind, b []byte) ids.Hash {
 	}
 	dl := n.now().Add(n.tun.CapTTL)
 	if r := n.recs[blobKey(h)]; r != nil {
-		r.deadline, r.touched = dl, dl
+		r.deadline, r.touched, r.origin = dl, dl, n.newOrigin()
 		n.setFlags(r, r.flags|fIssuer)
 		n.replicate(r, modeStore, nil)
 		return h
 	}
-	r := &record{key: blobKey(h), data: b, blobKind: kind, deadline: dl, touched: dl}
+	r := &record{key: blobKey(h), data: b, blobKind: kind, deadline: dl, touched: dl, origin: n.newOrigin()}
 	n.putNew(r, fIssuer)
 	n.replicate(r, modeStore, nil)
 	return h
@@ -329,7 +329,7 @@ func (n *Node) createCap(c *caprec.Record, durable bool, done func(ids.CapID, *c
 		c.Lineage = ids.Lineage(id)
 	}
 	dl := n.now().Add(n.tun.CapTTL)
-	r := &record{key: capKey(id), data: c.Encode(), cap: c, deadline: dl, touched: dl}
+	r := &record{key: capKey(id), data: c.Encode(), cap: c, deadline: dl, touched: dl, origin: n.newOrigin()}
 	if c.SingleUse {
 		n.putNew(r, fHolder|fIssuer)
 		done(id, nil)

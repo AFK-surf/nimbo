@@ -77,6 +77,11 @@ type record struct {
 	cap      *caprec.Record
 	deadline time.Time // local
 	touched  time.Time // deadline last propagated to the placement set
+	// origin stamps the use that set deadline. Relays carry the deadline as
+	// a relative TTL, so each hop adds its in-flight time; a relay of the
+	// same use must not extend it again, or records ping-ponging between
+	// Brokers outlive their last use.
+	origin   uint64
 	consumed bool
 	flags    uint8
 	hintFor  ids.BrokerID
@@ -155,6 +160,7 @@ func (n *Node) wireRec(r *record) *peerproto.Rec {
 		BlobKind: r.blobKind,
 		TTLms:    ms(n.remaining(r)),
 		Consumed: r.consumed,
+		Origin:   r.origin,
 	}
 }
 
@@ -169,7 +175,7 @@ func (n *Node) mergeWire(w *peerproto.Rec) *record {
 	dl := n.now().Add(ttl)
 	r := n.recs[rk]
 	if r == nil {
-		r = &record{key: rk, data: w.Data, blobKind: w.BlobKind, deadline: dl, touched: dl, consumed: w.Consumed}
+		r = &record{key: rk, data: w.Data, blobKind: w.BlobKind, deadline: dl, touched: dl, origin: w.Origin, consumed: w.Consumed}
 		switch rk.kind {
 		case peerproto.KindCap:
 			c, err := caprec.Decode(w.Data)
@@ -185,16 +191,27 @@ func (n *Node) mergeWire(w *peerproto.Rec) *record {
 		n.putNew(r, 0)
 		return r
 	}
-	if dl.After(r.deadline) {
-		r.deadline = dl
-	}
-	if dl.After(r.touched) {
-		r.touched = dl
-	}
+	n.extend(r, dl, w.Origin)
 	r.consumed = r.consumed || w.Consumed
 	n.lruTouch(r)
 	return r
 }
+
+// extend applies a relayed deadline: it slides the record's deadline unless
+// the relay is of the use that already set it.
+func (n *Node) extend(r *record, dl time.Time, origin uint64) {
+	if origin != 0 && origin == r.origin {
+		return
+	}
+	if dl.After(r.deadline) {
+		r.deadline, r.origin = dl, origin
+	}
+	if dl.After(r.touched) {
+		r.touched = dl
+	}
+}
+
+func (n *Node) newOrigin() uint64 { return ids.RandUint64(n.env.Rand()) | 1 }
 
 func (n *Node) sweepRecords() {
 	var drop []*record
@@ -347,7 +364,7 @@ func (n *Node) writeHinted(rk recKey, intended ids.BrokerID) {
 func (n *Node) useRec(r *record) {
 	dl := n.now().Add(n.tun.CapTTL)
 	if dl.After(r.deadline) {
-		r.deadline = dl
+		r.deadline, r.origin = dl, n.newOrigin()
 	}
 	n.lruTouch(r)
 	if r.deadline.Sub(r.touched) >= n.tun.TouchThreshold {
@@ -386,13 +403,7 @@ func (n *Node) handleRCR(from ids.BrokerID, b *peerproto.RCRBatch) *peerproto.RC
 				res[i] = peerproto.OpMissing
 				continue
 			}
-			dl := n.now().Add(min(fromMs(op.Touch.TTLms), n.tun.CapTTL))
-			if dl.After(r.deadline) {
-				r.deadline = dl
-			}
-			if dl.After(r.touched) {
-				r.touched = dl
-			}
+			n.extend(r, n.now().Add(min(fromMs(op.Touch.TTLms), n.tun.CapTTL)), op.Touch.Origin)
 			if op.Hint != nil && *op.Hint != n.id {
 				r.hintFor = *op.Hint
 				n.setFlags(r, r.flags|fHinted)

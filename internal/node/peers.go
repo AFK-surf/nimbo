@@ -289,7 +289,7 @@ func (n *Node) buildOp(op *repOp) (peerproto.Op, bool) {
 	if op.mode == modeStore {
 		w.Store = n.wireRec(r)
 	} else {
-		w.Touch = &peerproto.Touch{Kind: r.key.kind, ID: r.idBytes(), TTLms: ms(r.deadline.Sub(n.now()))}
+		w.Touch = &peerproto.Touch{Kind: r.key.kind, ID: r.idBytes(), TTLms: ms(r.deadline.Sub(n.now())), Origin: r.origin}
 	}
 	return w, true
 }
