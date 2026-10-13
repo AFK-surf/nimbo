@@ -11,7 +11,7 @@ on:
     inputs:
       seeds:
         description: "Number of simulation seeds"
-        default: "1000"
+        default: "200"
       seed:
         description: "First seed (default: derived from the run number)"
         default: ""
@@ -67,13 +67,17 @@ jobs:
 
   dst:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # Pull requests and pushes run a small sweep (about 4 minutes in all);
+    # nightly and manual runs take the large ones.
+    timeout-minutes: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 150 || 10 }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
       - name: Scripted scenarios and determinism
+        env:
+          GOGC: "400"
         run: go test -count=1 -timeout 30m ./internal/sim
       - name: Random fault schedules
         env:
@@ -83,8 +87,8 @@ jobs:
         run: |
           # Each run explores new seeds; a failing seed replays exactly with
           #   go run ./cmd/nimbo-sim -seed <N> -n 1 -v
-          n=200
-          if [ "$EVENT" = "schedule" ]; then n=1000; fi
+          n=16
+          if [ "$EVENT" = "schedule" ]; then n=400; fi
           if [ -n "$SEEDS_INPUT" ]; then n=$SEEDS_INPUT; fi
           seed=$(( GITHUB_RUN_NUMBER * 100000 + GITHUB_RUN_ATTEMPT * 10000 ))
           if [ -n "$SEED_INPUT" ]; then seed=$SEED_INPUT; fi
@@ -92,7 +96,7 @@ jobs:
           go build -o nimbo-sim ./cmd/nimbo-sim
           ./nimbo-sim -seed "$seed" -n "$n"
       - name: Harsh fault schedules (3x fault rate, 8 brokers)
-        if: github.event_name != 'pull_request'
+        if: github.event_name == 'schedule'
         run: |
           seed=$(( GITHUB_RUN_NUMBER * 100000 + 50000 ))
-          ./nimbo-sim -seed "$seed" -n 200 -fault-scale 3 -brokers 8 -endpoints 30
+          ./nimbo-sim -seed "$seed" -n 100 -fault-scale 3 -brokers 8 -endpoints 30

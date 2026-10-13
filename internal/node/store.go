@@ -340,23 +340,24 @@ func (n *Node) fallbackFor(pkey ids.Hash) ids.BrokerID {
 }
 
 // writeHinted stores a hinted copy for intended on the next-nearest
-// non-suspect Broker.
-func (n *Node) writeHinted(rk recKey, intended ids.BrokerID) {
+// non-suspect Broker and returns that Broker (zero if none).
+func (n *Node) writeHinted(rk recKey, intended ids.BrokerID) ids.BrokerID {
 	r := n.recs[rk]
 	if r == nil {
-		return
+		return ids.BrokerID{}
 	}
 	fb := n.fallbackFor(r.pkey)
 	if fb.IsZero() {
-		return
+		return fb
 	}
 	n.stats.HintedWrites++
 	if fb == n.id {
 		r.hintFor = intended
 		n.setFlags(r, r.flags|fHinted)
-		return
+		return fb
 	}
 	n.enqueue(fb, rk, modeStore, intended, nil)
+	return fb
 }
 
 // useRec records a use: slide the local deadline and touch the placement

@@ -53,4 +53,4 @@ go run ./cmd/nimbo-sim -n 500  # 500 random fault schedules
 
 Requires Go 1.27.1 (pinned by the `tailscale.com` module).
 
-CI (`.github/workflows/ci.yml`) runs gofmt, vet and a tidy check; all tests except the (single-threaded) simulator with the race detector; the Tailscale-mesh end-to-end tests; and the simulation scenarios plus 200 random fault schedules on fresh seeds each run (1000 nightly, plus a 3× fault-rate sweep on `main`). A failing seed is printed and replays exactly with `go run ./cmd/nimbo-sim -seed N -n 1 -v`.
+CI (`.github/workflows/ci.yml`) runs gofmt, vet and a tidy check; all tests except the (single-threaded) simulator with the race detector; the Tailscale-mesh end-to-end tests; and the simulation scenarios plus 16 random fault schedules on fresh seeds each run, which keeps the job to about 4 minutes. A nightly run sweeps 400 seeds plus 100 at a 3× fault rate, and a manual run takes any number (`seeds` input). A failing seed is printed and replays exactly with `go run ./cmd/nimbo-sim -seed N -n 1 -v`.

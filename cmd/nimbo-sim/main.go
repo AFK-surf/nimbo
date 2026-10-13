@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"runtime/debug"
+	"runtime/pprof"
 	"sort"
 	"sync"
 	"text/tabwriter"
@@ -29,7 +31,22 @@ func main() {
 	par := flag.Int("p", runtime.NumCPU(), "parallel runs")
 	account := flag.Bool("account", false, "protocol cost report: one fault-free run, counters reset after -warm")
 	warm := flag.Duration("warm", 2*time.Minute, "warm-up before accounting starts (with -account)")
+	cpuprofile := flag.String("cpuprofile", "", "write a CPU profile")
 	flag.Parse()
+	if os.Getenv("GOGC") == "" {
+		// The simulation's heap is small and allocation-heavy: trading
+		// memory for fewer collections cuts its run time by about a fifth.
+		debug.SetGCPercent(400)
+	}
+	if *cpuprofile != "" {
+		f, err := os.Create(*cpuprofile)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
+	}
 	if *account {
 		cfg := sim.Config{Seed: *seed, Brokers: *brokers, Endpoints: *endpoints, FaultPhase: *warm, Quiet: *quiet}
 		cfg.Script = func(w *sim.World) { w.At(*warm, w.ResetAccounting) }
