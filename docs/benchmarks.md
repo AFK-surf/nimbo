@@ -75,7 +75,7 @@ No message was bounced, dropped or held in any scenario.
 
 Userspace WireGuard and gVisor netstack cost about a fifth of the throughput on the same 4 cores, where clients, Brokers and the mesh all compete. Unloaded latency is no worse; the lower open-loop p50 on Tailscale is within run-to-run noise.
 
-The Tailscale cluster takes about 36 s to warm up. That is a property of the benchmark setup, which runs without a DERP relay; see §5, item 5.
+The Tailscale numbers above were taken without DERP relays. `nimbo-bench -mesh tailscale` now uses Tailscale's public relays by default (`-derp-map` chooses others, or `none`). Locally reachable Brokers still talk directly over UDP, so steady-state numbers should not change. Cluster warm-up went from 36 s to 5.5 s, through the membership signal (§5, item 5), not the relays.
 
 ## 4. Protocol cost at 100 Brokers (simulation)
 
@@ -131,9 +131,10 @@ With 6 Brokers and 24 endpoints the same workload costs 11 frames per delivered 
    - A send on a single-use cap consumes the cap instead of touching it, and such sends are bounded by the action rate. They are now exempt from the quota.
    - Renew, inspect, transfer and carried caps still count.
    - `nimbo-bench` now reports failed reply sends instead of ignoring them.
-5. **Without a DERP relay, a Broker started earlier cannot hear joiners until its next poll** (not fixed). The first Broker's S3 listing contains only itself. Joiners know it, but magicsock will not send a WireGuard handshake until a disco ping confirms a direct path, and the first Broker drops disco pings from keys it does not know. So no handshake arrives, `OnUnknownPeer` never fires, fast join never runs, and the joiners' Rejoins fail with `not sent`. The first Broker learns about the joiners only from its next 30 s member poll, which is the 36 s warm-up in §3.
-   - With a relay, as the design requires (at least one relay Broker per Cluster), the handshake goes through DERP and triggers fast join.
-   - No test exercises the DERP path end to end. The next step is to run `nimbo-bench` and the mesh tests with an embedded DERP relay.
+5. **A Broker started earlier could not hear joiners until its next 30 s poll.** Its S3 listing did not contain them yet, and over the Tailscale mesh their packets never reach WireGuard: magicsock drops packets from unknown node keys, whether direct or relayed through DERP. So `OnUnknownPeer` never fired, fast join never ran, and the joiners' Rejoins failed with `not sent`. Benchmark warm-up was 36 s.
+   - Fixed with a membership signal object in S3. A Broker rewrites `members.signal` after its member object changes (join, restart, new endpoints or relay, draining, leave). Every Broker checks its ETag every 5 s and re-reads membership only when it changed. The 30 s full poll stays as the backstop for crashes.
+   - Warm-up is now 5.5 s.
+   - The same investigation removed DERP serving from Brokers: each Broker now chooses its own external relays (Tailscale's public ones by default) and publishes its home relay in its member object, and peers add it to their DERP maps.
 
 ## 6. Where the next gains are
 
