@@ -11,9 +11,11 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"time"
 
 	"go4.org/mem"
 	"go4.org/netipx"
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/dns"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/tsdial"
@@ -96,6 +98,7 @@ type TS struct {
 	homeDERP int
 	derp     derpIndex
 	members  []node.Member // last SetPeers
+	nodes    map[ids.BrokerID]tailcfg.NodeView
 }
 
 type accepted struct {
@@ -361,6 +364,7 @@ func (t *TS) SetPeers(members []node.Member) {
 	byKey := map[key.NodePublic]ids.BrokerID{}
 	byIP := map[netip.Addr]key.NodePublic{}
 	disco := map[key.NodePublic]key.DiscoPublic{}
+	nodes := map[ids.BrokerID]tailcfg.NodeView{}
 	for i, m := range members {
 		if m.ID == t.self {
 			continue
@@ -397,13 +401,14 @@ func (t *TS) SetPeers(members []node.Member) {
 			MachineAuthorized: true,
 		}
 		peers = append(peers, n.View())
+		nodes[m.ID] = n.View()
 		byKey[k] = m.ID
 		byIP[ip] = k
 		disco[k] = dk
 	}
 	t.mu.Lock()
 	old, oldDisco := t.byKey, t.disco
-	t.byKey, t.byIP, t.disco = byKey, byIP, disco
+	t.byKey, t.byIP, t.disco, t.nodes = byKey, byIP, disco, nodes
 	t.mu.Unlock()
 	t.ms.SetNetworkMap(t.selfNode().View(), peers)
 	for k := range old {
@@ -432,6 +437,114 @@ func (t *TS) SetDERPMap(dm *tailcfg.DERPMap) error {
 	t.SetPeers(members)
 	t.reportLocal()
 	return nil
+}
+
+// PeerPaths reports, for each peer Broker, whether WireGuard traffic goes
+// directly over UDP or through a DERP relay, plus handshake and byte counts.
+// With ping > 0 it also disco-pings every peer (in parallel, waiting at most
+// ping) and reports the round trip and the path the pong took.
+func (t *TS) PeerPaths(ping time.Duration) []node.MeshPeer {
+	sb := &ipnstate.StatusBuilder{WantPeers: true}
+	t.eng.UpdateStatus(sb)
+	st := sb.Status()
+	t.mu.Lock()
+	byKey := make(map[key.NodePublic]ids.BrokerID, len(t.byKey))
+	for k, id := range t.byKey {
+		byKey[k] = id
+	}
+	region := map[ids.BrokerID]string{}
+	for _, m := range t.members {
+		region[m.ID] = m.Info.Region
+	}
+	t.mu.Unlock()
+	out := make([]node.MeshPeer, 0, len(byKey))
+	for k, id := range byKey {
+		mp := node.MeshPeer{ID: id.String(), Short: id.Abbrev(), Region: region[id], Path: "idle"}
+		if ps := st.Peer[k]; ps != nil {
+			fillPeer(&mp, ps)
+		}
+		out = append(out, mp)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	if ping > 0 {
+		t.pingAll(out, ping)
+	}
+	return out
+}
+
+// fillPeer copies magicsock's and WireGuard's view of a peer into mp.
+func fillPeer(mp *node.MeshPeer, ps *ipnstate.PeerStatus) {
+	mp.DERP = ps.Relay
+	mp.RxBytes, mp.TxBytes = ps.RxBytes, ps.TxBytes
+	if !ps.LastHandshake.IsZero() {
+		h := ps.LastHandshake
+		mp.LastHandshake = &h
+	}
+	if !ps.LastWrite.IsZero() {
+		w := ps.LastWrite
+		mp.LastWrite = &w
+	}
+	switch {
+	case ps.CurAddr != "":
+		mp.Path, mp.Addr = "direct", ps.CurAddr
+	case ps.PeerRelay != "":
+		mp.Path, mp.Addr = "peer-relay", ps.PeerRelay
+	case ps.Active:
+		mp.Path = "derp"
+	}
+}
+
+func (t *TS) pingAll(peers []node.MeshPeer, timeout time.Duration) {
+	t.mu.Lock()
+	nodes := t.nodes
+	t.mu.Unlock()
+	var wg sync.WaitGroup
+	for i := range peers {
+		id, err := ids.ParseBrokerID(peers[i].ID)
+		if err != nil {
+			continue
+		}
+		nv, ok := nodes[id]
+		if !ok {
+			continue
+		}
+		wg.Add(1)
+		go func(mp *node.MeshPeer) {
+			defer wg.Done()
+			done := make(chan *ipnstate.PingResult, 1)
+			res := &ipnstate.PingResult{IP: ULA(id).String()}
+			t.ms.Ping(nv, res, 0, func(r *ipnstate.PingResult) {
+				select {
+				case done <- r:
+				default:
+				}
+			})
+			select {
+			case r := <-done:
+				fillPing(mp, r)
+			case <-time.After(timeout):
+				mp.PingErr = "timeout"
+			}
+		}(&peers[i])
+	}
+	wg.Wait()
+}
+
+func fillPing(mp *node.MeshPeer, r *ipnstate.PingResult) {
+	if r.Err != "" {
+		mp.PingErr = r.Err
+		return
+	}
+	ms := r.LatencySeconds * 1000
+	mp.LatencyMs = &ms
+	switch {
+	case r.DERPRegionID != 0:
+		mp.PingPath = "derp"
+	case r.PeerRelay != "":
+		mp.PingPath = "peer-relay"
+	default:
+		mp.PingPath = "direct"
+	}
 }
 
 // LocalPort is magicsock's UDP port.

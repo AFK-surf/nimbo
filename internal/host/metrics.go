@@ -4,9 +4,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/afk-surf/nimbo/internal/node"
 )
+
+// PeerPather is implemented by meshes that can report how each peer is
+// reached; /debug/stats includes it. A positive ping also measures each
+// peer's round trip, waiting at most that long.
+type PeerPather interface {
+	PeerPaths(ping time.Duration) []node.MeshPeer
+}
 
 // Snapshot reads the node's counters on the loop.
 func (h *Host) Snapshot() node.Snapshot {
@@ -73,9 +81,21 @@ func (h *Host) MetricsHandler() http.Handler {
 		fmt.Fprintln(w, "ok")
 	})
 	mux.HandleFunc("/debug/stats", func(w http.ResponseWriter, r *http.Request) {
-		s := h.Snapshot()
+		out := struct {
+			node.Snapshot
+			// MeshPeers is the data plane's path to each peer, when the
+			// mesh reports it (the Tailscale mesh does).
+			MeshPeers []node.MeshPeer `json:",omitempty"`
+		}{Snapshot: h.Snapshot()}
+		if pp, ok := h.opts.Mesh.(PeerPather); ok {
+			var ping time.Duration
+			if r.URL.Query().Has("ping") {
+				ping = 2 * time.Second
+			}
+			out.MeshPeers = pp.PeerPaths(ping)
+		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(s)
+		json.NewEncoder(w).Encode(out)
 	})
 	return mux
 }
