@@ -1,0 +1,33 @@
+package wire
+
+import (
+	"encoding/base32"
+	"testing"
+
+	"golang.org/x/crypto/curve25519"
+)
+
+// TestProofVector pins the handshake proof for fixed inputs. The TypeScript
+// SDK's tests (sdk/typescript/test/unit.ts) check the same vector.
+func TestProofVector(t *testing.T) {
+	b32 := base32.NewEncoding("abcdefghijklmnopqrstuvwxyz234567").WithPadding(base32.NoPadding)
+	var e, b, nonce [32]byte
+	for i := range 32 {
+		e[i], b[i], nonce[i] = byte(i+1), byte(i+101), byte(200+i)
+	}
+	ePub, _ := curve25519.X25519(e[:], curve25519.Basepoint)
+	bPub, _ := curve25519.X25519(b[:], curve25519.Basepoint)
+	ss, err := curve25519.X25519(e[:], bPub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct{ name, got, want string }{
+		{"E_pub", b32.EncodeToString(ePub), "a6rxzpauecj4rn2v3qnrb2dmwqtdoswrnkufh3il37alfodndr6a"},
+		{"B_eph_pub", b32.EncodeToString(bPub), "k4khnhirnp3winvoos6hspjmgcwrsa6ftlcsooafy7rgtc2bbq3a"},
+		{"proof", b32.EncodeToString(Proof(ss, nonce[:], "broker.example.com:8443", ePub, bPub)), "eduhkxbs7jcu7n3zvn3fakah6lsnxah76bhsbunk7mwm3vb7ymia"},
+	} {
+		if c.got != c.want {
+			t.Errorf("%s = %s, want %s", c.name, c.got, c.want)
+		}
+	}
+}
