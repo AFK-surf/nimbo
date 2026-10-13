@@ -1,0 +1,4 @@
+# Binaries built from cmd/ at the repository root
+/nimbo-bench
+/nimbo-sim
+/nimbod
