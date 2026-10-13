@@ -1,6 +1,7 @@
 package node
 
 import (
+	"encoding/json"
 	"net/netip"
 	"time"
 )
@@ -24,14 +25,15 @@ type Tunables struct {
 	MaxReroutes          int
 	HoldBackstop         time.Duration
 
-	MemberHeartbeat time.Duration
-	MemberPoll      time.Duration
-	MemberTTL       time.Duration
-	FenceMargin     time.Duration
-	MaxSkew         time.Duration
-	FastJoinNegTTL  time.Duration
-	FastJoinPerSec  float64
-	RejoinRetry     time.Duration
+	MemberHeartbeat  time.Duration
+	MemberPoll       time.Duration // full refresh backstop: finds crashed Brokers
+	MemberSignalPoll time.Duration // membership signal check
+	MemberTTL        time.Duration
+	FenceMargin      time.Duration
+	MaxSkew          time.Duration
+	FastJoinNegTTL   time.Duration
+	FastJoinPerSec   float64
+	RejoinRetry      time.Duration
 
 	SuspectBase time.Duration
 	SuspectMax  time.Duration
@@ -69,14 +71,15 @@ func DefaultTunables() Tunables {
 		MaxReroutes:          2,
 		HoldBackstop:         2 * time.Second,
 
-		MemberHeartbeat: 15 * time.Second,
-		MemberPoll:      30 * time.Second,
-		MemberTTL:       60 * time.Second,
-		FenceMargin:     15 * time.Second,
-		MaxSkew:         3 * time.Second,
-		FastJoinNegTTL:  60 * time.Second,
-		FastJoinPerSec:  10,
-		RejoinRetry:     time.Second,
+		MemberHeartbeat:  15 * time.Second,
+		MemberPoll:       30 * time.Second,
+		MemberSignalPoll: 5 * time.Second,
+		MemberTTL:        60 * time.Second,
+		FenceMargin:      15 * time.Second,
+		MaxSkew:          3 * time.Second,
+		FastJoinNegTTL:   60 * time.Second,
+		FastJoinPerSec:   10,
+		RejoinRetry:      time.Second,
 
 		SuspectBase: 10 * time.Second,
 		SuspectMax:  2 * time.Minute,
@@ -144,32 +147,22 @@ func DefaultLimits() Limits {
 	}
 }
 
-// DERPInfo describes an embedded DERP relay in a member object.
-type DERPInfo struct {
-	RegionID   int    `json:"region_id"`
-	RegionCode string `json:"region_code,omitempty"`
-	HostName   string `json:"hostname"`
-	IPv4       string `json:"ipv4,omitempty"`
-	IPv6       string `json:"ipv6,omitempty"`
-	STUNPort   int    `json:"stun_port,omitempty"`
-	DERPPort   int    `json:"derp_port,omitempty"`
-}
-
 // MemberInfo is the JSON member object in S3 (design §4).
 type MemberInfo struct {
-	NodePub     string    `json:"node_pub"` // hex of the 32-byte node public key
-	DiscoPub    string    `json:"disco_pub,omitempty"`
-	Incarnation string    `json:"incarnation"` // hex uint64
-	Draining    bool      `json:"draining"`
-	Version     string    `json:"version"`
-	WSURLs      []string  `json:"ws_urls,omitempty"`
-	DERP        *DERPInfo `json:"derp,omitempty"`
-	Region      string    `json:"region,omitempty"`
+	NodePub     string   `json:"node_pub"` // hex of the 32-byte node public key
+	DiscoPub    string   `json:"disco_pub,omitempty"`
+	Incarnation string   `json:"incarnation"` // hex uint64
+	Draining    bool     `json:"draining"`
+	Version     string   `json:"version"`
+	WSURLs      []string `json:"ws_urls,omitempty"`
+	Region      string   `json:"region,omitempty"`
 	// Endpoints lists the mesh's direct endpoints ("ip:port"): UDP for
 	// the Tailscale mesh, TCP for the development mesh.
 	Endpoints []string `json:"endpoints,omitempty"`
-	// HomeDERP is the DERP region this Broker is reachable through.
-	HomeDERP int `json:"home_derp,omitempty"`
+	// DERP is the DERP relay region this Broker chose as its home, as a
+	// Tailscale DERPRegion object, so peers can reach it through that relay.
+	// Brokers are not relays. Opaque to the node.
+	DERP json.RawMessage `json:"derp,omitempty"`
 }
 
 // Config configures a Node.

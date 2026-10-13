@@ -31,12 +31,13 @@ import (
 	"github.com/pires/go-proxyproto"
 
 	"github.com/afk-surf/nimbo/internal/config"
-	"github.com/afk-surf/nimbo/internal/derpsrv"
 	"github.com/afk-surf/nimbo/internal/host"
 	"github.com/afk-surf/nimbo/internal/ids"
 	"github.com/afk-surf/nimbo/internal/mesh"
 	"github.com/afk-surf/nimbo/internal/node"
 	"github.com/afk-surf/nimbo/internal/s3store"
+
+	"tailscale.com/tailcfg"
 )
 
 func main() {
@@ -175,7 +176,7 @@ func cmdRun(args []string) error {
 	var sf s3Flags
 	sf.register(fs)
 	stateDir := fs.String("state-dir", os.Getenv("NIMBOD_STATE_DIR"), "directory for node.key (optional)")
-	listen := fs.String("listen", ":8443", "HTTP(S) listen address for /v1/ws and /derp")
+	listen := fs.String("listen", ":8443", "HTTP(S) listen address for /v1/ws")
 	tlsCert := fs.String("tls-cert", "", "TLS certificate (omit when TLS terminates at a load balancer)")
 	tlsKey := fs.String("tls-key", "", "TLS key")
 	proxyProto := fs.Bool("proxy-protocol", false, "require PROXY protocol v2 on -listen (behind a load balancer)")
@@ -184,11 +185,9 @@ func cmdRun(args []string) error {
 	region := fs.String("region", "", "region label, used to suggest nearby Brokers")
 	meshPort := fs.Int("mesh-port", 41641, "UDP port for the Tailscale mesh (tcp mesh: TCP port)")
 	meshAdvertise := fs.String("mesh-advertise", "", "comma-separated ip:port endpoints to advertise for the mesh")
-	derpRegion := fs.Int("derp-region", 0, "serve DERP as this region ID (needs a public hostname and TLS)")
-	derpCode := fs.String("derp-region-code", "nimbo", "DERP region code")
-	derpHost := fs.String("derp-host", "", "public hostname of this DERP relay")
-	derpPort := fs.Int("derp-port", 443, "public HTTPS port of this DERP relay")
-	stunListen := fs.String("stun-listen", ":3478", "STUN listen address when serving DERP")
+	derpMapSrc := fs.String("derp-map", mesh.DefaultDERPMapURL, "DERP relays to choose the home relay from: map URL, JSON file, or none")
+	derpRelay := fs.String("derp-relay", "", "use this one DERP relay (host[:port], e.g. a self-hosted derper) instead of -derp-map")
+	derpInsecure := fs.Bool("derp-insecure", false, "do not verify the TLS certificates of this Broker's DERP relays (peers dialing them skip it too)")
 	metricsListen := fs.String("metrics-listen", "127.0.0.1:9090", "listen address for /metrics, /healthz and /debug/stats")
 	verbose := fs.Bool("v", false, "verbose mesh logging")
 	fs.Parse(args)
@@ -227,17 +226,10 @@ func cmdRun(args []string) error {
 		url = "wss://" + names[0] + "/v1/ws"
 	}
 	member := node.MemberInfo{WSURLs: []string{url}, Region: *region}
-	if *derpRegion > 0 {
-		if *derpHost == "" {
-			return errors.New("-derp-host is required with -derp-region")
-		}
-		member.DERP = &node.DERPInfo{RegionID: *derpRegion, RegionCode: *derpCode, HostName: *derpHost, DERPPort: *derpPort, STUNPort: 3478}
-	}
 
 	var h *host.Host
 	bridge := &meshBridge{}
 	var meshT host.Mesh
-	var derp *derpsrv.Server
 	var advertise []netip.AddrPort
 	for _, a := range splitList(*meshAdvertise) {
 		ap, err := netip.ParseAddrPort(a)
@@ -262,6 +254,31 @@ func cmdRun(args []string) error {
 		meshT = tm
 	case "tailscale":
 		tsLog := logger.With("component", "mesh")
+		// This Broker's own choice of relays; it publishes the one it uses
+		// in its member object, and reaches peers through theirs.
+		var derpMap *tailcfg.DERPMap
+		refresh := false
+		switch {
+		case *derpRelay != "":
+			if derpMap, err = mesh.RelayMap(*derpRelay); err != nil {
+				return err
+			}
+		case *derpMapSrc != "none":
+			lctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			derpMap, err = mesh.LoadDERPMap(lctx, *derpMapSrc)
+			cancel()
+			if derpMap == nil {
+				return fmt.Errorf("-derp-map: %w", err)
+			}
+			if err != nil {
+				logger.Warn("DERP map: using the built-in copy of Tailscale's relays", "err", err)
+			}
+			refresh = strings.HasPrefix(*derpMapSrc, "http")
+		}
+		if derpMap != nil && *derpInsecure {
+			logger.Warn("DERP relay certificates are not verified (-derp-insecure)")
+			derpMap = mesh.SkipCertVerify(derpMap)
+		}
 		ts, err := mesh.NewTS(mesh.TSConfig{
 			NodePrivate:     key.Private,
 			PSK:             psk,
@@ -273,26 +290,19 @@ func cmdRun(args []string) error {
 				}
 			},
 			OnUnknownPeer: func(id ids.BrokerID) { bridge.unknownPeer(id) },
-			OnLocalInfo:   func(disco string, eps []string, home int) { bridge.localInfo(disco, eps, home) },
+			OnLocalInfo:   func(disco string, eps []string, derp json.RawMessage) { bridge.localInfo(disco, eps, derp) },
+			DERPMap:       derpMap,
 		})
 		if err != nil {
 			return fmt.Errorf("mesh: %w", err)
+		}
+		if refresh {
+			go refreshDERPMap(ctx, ts, *derpMapSrc, *derpInsecure, logger)
 		}
 		meshT = ts
 	default:
 		return fmt.Errorf("cluster.json: unknown mesh %q", cluster.Mesh)
 	}
-	if *derpRegion > 0 {
-		derp, err = derpsrv.New(self, *derpRegion, cluster.DERPMeshKey, func(f string, a ...any) { logger.Info("derp: " + fmt.Sprintf(f, a...)) })
-		if err != nil {
-			return err
-		}
-		if err := derpsrv.ServeSTUN(ctx, *stunListen); err != nil {
-			return err
-		}
-		meshT = withDERP{meshT, derp}
-	}
-
 	left := make(chan struct{})
 	h = host.New(host.Options{
 		Node: node.Config{
@@ -312,9 +322,6 @@ func cmdRun(args []string) error {
 
 	mux := http.NewServeMux()
 	mux.Handle("/v1/ws", h)
-	if derp != nil {
-		derp.Register(mux)
-	}
 	ln, err := net.Listen("tcp", *listen)
 	if err != nil {
 		return err
@@ -362,15 +369,31 @@ func cmdRun(args []string) error {
 	return nil
 }
 
-// withDERP also reconfigures the DERP mesh on membership changes.
-type withDERP struct {
-	host.Mesh
-	d *derpsrv.Server
-}
-
-func (w withDERP) SetPeers(ms []node.Member) {
-	w.Mesh.SetPeers(ms)
-	w.d.SetPeers(ms)
+// refreshDERPMap reloads this Broker's DERP map hourly, so relays the
+// operator adds or retires are picked up without a restart.
+func refreshDERPMap(ctx context.Context, ts *mesh.TS, url string, insecure bool, logger *slog.Logger) {
+	t := time.NewTicker(time.Hour)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		lctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		dm, err := mesh.LoadDERPMap(lctx, url)
+		cancel()
+		if err != nil {
+			logger.Warn("DERP map refresh failed; keeping the current map", "err", err)
+			continue
+		}
+		if insecure {
+			dm = mesh.SkipCertVerify(dm)
+		}
+		if err := ts.SetDERPMap(dm); err != nil {
+			logger.Warn("DERP map refresh rejected; keeping the current map", "err", err)
+		}
+	}
 }
 
 func splitList(s string) []string {
@@ -402,11 +425,11 @@ func (b *meshBridge) attach(h *host.Host) {
 	}
 }
 
-func (b *meshBridge) localInfo(disco string, eps []string, home int) {
+func (b *meshBridge) localInfo(disco string, eps []string, derp json.RawMessage) {
 	apply := func(h *host.Host) {
 		h.Do(func() {
 			h.Node().UpdateMemberInfo(func(mi *node.MemberInfo) {
-				mi.DiscoPub, mi.Endpoints, mi.HomeDERP = disco, eps, home
+				mi.DiscoPub, mi.Endpoints, mi.DERP = disco, eps, derp
 			})
 		})
 	}

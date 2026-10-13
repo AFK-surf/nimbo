@@ -63,12 +63,12 @@ func (n *Node) writeBlob(kind peerproto.BlobKind, b []byte) ids.Hash {
 	}
 	dl := n.now().Add(n.tun.CapTTL)
 	if r := n.recs[blobKey(h)]; r != nil {
-		r.deadline, r.touched = dl, dl
+		r.deadline, r.touched, r.origin = dl, dl, n.newOrigin()
 		n.setFlags(r, r.flags|fIssuer)
 		n.replicate(r, modeStore, nil)
 		return h
 	}
-	r := &record{key: blobKey(h), data: b, blobKind: kind, deadline: dl, touched: dl}
+	r := &record{key: blobKey(h), data: b, blobKind: kind, deadline: dl, touched: dl, origin: n.newOrigin()}
 	n.putNew(r, fIssuer)
 	n.replicate(r, modeStore, nil)
 	return h
@@ -175,11 +175,9 @@ type validated struct {
 	base   *record
 }
 
-func (n *Node) validateCap(s *session, id ids.CapID, cb func(*validated, *capErr)) {
-	if !n.noteUse(s, id) {
-		cb(nil, cerr(wire.ErrRateLimited, "distinct caps"))
-		return
-	}
+// validateCap runs the checks every use of a cap shares. send marks a send
+// on the cap, which consumes a single-use cap.
+func (n *Node) validateCap(s *session, id ids.CapID, send bool, cb func(*validated, *capErr)) {
 	rk := capKey(id)
 	if n.recs[rk] == nil {
 		if s.unknown >= n.lim.UnknownPer10s {
@@ -207,6 +205,14 @@ func (n *Node) validateCap(s *session, id ids.CapID, cb func(*validated, *capErr
 		}
 		if r.consumed {
 			cb(nil, cerr(wire.ErrConsumed, ""))
+			return
+		}
+		// The distinct-caps quota bounds the Touches a session can cause. A
+		// send on a single-use cap consumes it instead, and such sends are
+		// bounded by the action rate: exempt them, or a responder could not
+		// answer as fast as a requester may create reply caps.
+		if !(send && r.cap.SingleUse) && !n.noteUse(s, id) {
+			cb(nil, cerr(wire.ErrRateLimited, "distinct caps"))
 			return
 		}
 		next := func(r *record) {
@@ -294,10 +300,17 @@ func (n *Node) newCapID() ids.CapID {
 // singleUseID draws IDs until this Broker is the nearest live Broker to
 // SHA-256(ID) (design §8.3).
 func (n *Node) singleUseID() (ids.CapID, bool) {
-	for i := 0; i < 8192; i++ {
-		id := n.newCapID()
-		if near := n.view.nearestAll(id.PlacementKey(), 1); len(near) == 1 && near[0] == n.id {
-			return id, true
+	// Expected tries: about the number of Brokers. Draw randomness in
+	// batches and decide most candidates with the prefix table.
+	var buf [64 * 16]byte
+	for batch := 0; batch < 128; batch++ {
+		ids.RandBytes(n.env.Rand(), buf[:])
+		for i := 0; i < 64; i++ {
+			var id ids.CapID
+			copy(id[:], buf[i*16:])
+			if near, ok := n.view.idx.NearestOwnerFast(id.PlacementKey()); ok && near == n.id {
+				return id, true
+			}
 		}
 	}
 	return ids.CapID{}, false
@@ -322,7 +335,7 @@ func (n *Node) createCap(c *caprec.Record, durable bool, done func(ids.CapID, *c
 		c.Lineage = ids.Lineage(id)
 	}
 	dl := n.now().Add(n.tun.CapTTL)
-	r := &record{key: capKey(id), data: c.Encode(), cap: c, deadline: dl, touched: dl}
+	r := &record{key: capKey(id), data: c.Encode(), cap: c, deadline: dl, touched: dl, origin: n.newOrigin()}
 	if c.SingleUse {
 		n.putNew(r, fHolder|fIssuer)
 		done(id, nil)
@@ -431,7 +444,7 @@ func (n *Node) actTransfer(s *session, in *wire.In) {
 		n.fail(s, in.Rid, e.code, e.detail)
 		return
 	}
-	n.validateCap(s, id, func(v *validated, e *capErr) {
+	n.validateCap(s, id, false, func(v *validated, e *capErr) {
 		if e != nil {
 			n.fail(s, in.Rid, e.code, e.detail)
 			return
@@ -493,7 +506,7 @@ func (n *Node) actRenew(s *session, in *wire.In) {
 			finish()
 			continue
 		}
-		n.validateCap(s, id, func(v *validated, e *capErr) {
+		n.validateCap(s, id, false, func(v *validated, e *capErr) {
 			if e != nil {
 				out[i].Error = &wire.Error{Code: e.code, Detail: e.detail}
 				finish()
@@ -521,7 +534,7 @@ func (n *Node) actInspect(s *session, in *wire.In) {
 		n.fail(s, in.Rid, wire.ErrBadRequest, "cap")
 		return
 	}
-	n.validateCap(s, id, func(v *validated, e *capErr) {
+	n.validateCap(s, id, false, func(v *validated, e *capErr) {
 		if e != nil {
 			n.fail(s, in.Rid, e.code, e.detail)
 			return

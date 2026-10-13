@@ -60,7 +60,7 @@ func startClusterMesh(t *testing.T, n int, tailscale bool) []*broker {
 						h.UnknownPeer(id)
 					}
 				},
-				OnLocalInfo: func(disco string, eps []string, _ int) {
+				OnLocalInfo: func(disco string, eps []string, _ json.RawMessage) {
 					// As nimbod does: publish the disco key and the
 					// endpoints magicsock reports (it may rebind ports).
 					info.Lock()

@@ -151,3 +151,21 @@ func seeds() uint64 {
 	}
 	return 4
 }
+
+// Scale-up: Brokers join a running cluster while S3 is slow, so member
+// LISTs are often in flight when a joiner's Rejoin arrives. Membership,
+// presence and caps must stay correct throughout.
+func TestScaleUp(t *testing.T) {
+	for seed := uint64(1); seed <= seeds(); seed++ {
+		cfg := scripted(seed, nil)
+		cfg.S3Latency = [2]time.Duration{500 * time.Millisecond, 3 * time.Second}
+		cfg.Script = func(w *World) {
+			for i := 0; i < 4; i++ {
+				w.AddBroker(90*time.Second + time.Duration(i)*700*time.Millisecond)
+			}
+			w.CheckReplication(150 * time.Second)
+			w.ExpectStable(150*time.Second, 0, 85*time.Second)
+		}
+		runSeed(t, cfg)
+	}
+}

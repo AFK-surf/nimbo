@@ -244,7 +244,10 @@ func (e *env) MembersChanged(ms []node.Member) {
 	}
 	cp := append([]node.Member(nil), ms...)
 	h.members.Store(&cp)
-	go h.opts.Mesh.SetPeers(cp)
+	// Synchronously, so the mesh knows a new member before the node's
+	// first frame to it (an asynchronous update raced the first dial,
+	// failed it and made the peer suspect).
+	h.opts.Mesh.SetPeers(cp)
 }
 
 func (e *env) Left() {

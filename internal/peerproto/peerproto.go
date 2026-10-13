@@ -77,13 +77,15 @@ type Rec struct {
 	BlobKind BlobKind `cbor:"4,keyasint,omitempty"`
 	TTLms    int64    `cbor:"5,keyasint"` // remaining; negative if past deadline
 	Consumed bool     `cbor:"6,keyasint,omitempty"`
+	Origin   uint64   `cbor:"7,keyasint,omitempty"` // stamp of the use that set the deadline
 }
 
 // Touch extends a record's deadline.
 type Touch struct {
-	Kind  RecKind `cbor:"1,keyasint"`
-	ID    []byte  `cbor:"2,keyasint"`
-	TTLms int64   `cbor:"3,keyasint"`
+	Kind   RecKind `cbor:"1,keyasint"`
+	ID     []byte  `cbor:"2,keyasint"`
+	TTLms  int64   `cbor:"3,keyasint"`
+	Origin uint64  `cbor:"4,keyasint,omitempty"`
 }
 
 // PresenceStore carries full registers for one endpoint.

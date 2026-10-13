@@ -24,6 +24,10 @@ type repOp struct {
 	key     opKey
 	mode    opMode
 	waiters []func(bool)
+	// hintedTo holds the hinted copy written when a send of this op
+	// failed (zero if none), carrying the deadline hintedDL.
+	hintedTo ids.BrokerID
+	hintedDL timeT
 }
 
 type peer struct {
@@ -34,6 +38,7 @@ type peer struct {
 	order        []opKey
 	inflight     int
 	flushSched   bool
+	probing      bool
 }
 
 func (n *Node) peer(id ids.BrokerID) *peer {
@@ -81,6 +86,7 @@ func (n *Node) peerOK(id ids.BrokerID) {
 	}
 	if was {
 		n.repushPresenceTo(id)
+		n.kickHeld()
 	}
 }
 
@@ -164,6 +170,9 @@ func (n *Node) requeue(p *peer, op *repOp) {
 			cur.mode = op.mode
 		}
 		cur.waiters = append(cur.waiters, op.waiters...)
+		if cur.hintedTo.IsZero() {
+			cur.hintedTo, cur.hintedDL = op.hintedTo, op.hintedDL
+		}
 		return
 	}
 	p.q[op.key] = op
@@ -171,12 +180,25 @@ func (n *Node) requeue(p *peer, op *repOp) {
 }
 
 // requeueFailed re-queues an op whose send failed and writes a hinted copy
-// to the next-nearest non-suspect Broker.
+// to the next-nearest non-suspect Broker. The copy written on an earlier
+// failure is kept while it is on a healthy member and its deadline is less
+// than touch_threshold behind: retries to a crashed peer would otherwise
+// re-hint every queued op on every attempt.
 func (n *Node) requeueFailed(p *peer, op *repOp) {
 	n.requeue(p, op)
-	if op.key.hint.IsZero() && op.key.rk.kind != peerproto.KindPresence {
-		n.writeHinted(op.key.rk, p.id)
+	if !op.key.hint.IsZero() || op.key.rk.kind == peerproto.KindPresence {
+		return
 	}
+	r := n.recs[op.key.rk]
+	if r == nil {
+		return
+	}
+	cur := p.q[op.key]
+	if h := cur.hintedTo; !h.IsZero() && (h == n.id || n.view.members[h] != nil && !n.isSuspect(h)) &&
+		r.deadline.Sub(cur.hintedDL) < n.tun.TouchThreshold {
+		return
+	}
+	cur.hintedTo, cur.hintedDL = n.writeHinted(op.key.rk, p.id), r.deadline
 }
 
 func (n *Node) scheduleFlush(p *peer) {
@@ -287,14 +309,25 @@ func (n *Node) buildOp(op *repOp) (peerproto.Op, bool) {
 	if op.mode == modeStore {
 		w.Store = n.wireRec(r)
 	} else {
-		w.Touch = &peerproto.Touch{Kind: r.key.kind, ID: r.idBytes(), TTLms: ms(r.deadline.Sub(n.now()))}
+		w.Touch = &peerproto.Touch{Kind: r.key.kind, ID: r.idBytes(), TTLms: ms(r.deadline.Sub(n.now())), Origin: r.origin}
 	}
 	return w, true
 }
 
+// probeGet is a lookup nobody stores; any answer proves the peer is back.
+var probeGet = peerproto.Get{Kind: peerproto.KindCap, ID: make([]byte, 16)}
+
 func (n *Node) sweepPeers() {
 	for _, id := range sortedBrokerKeys(n.peers) {
 		p := n.peers[id]
+		// Probe suspected peers so that suspicion ends as soon as they
+		// answer, not only when its timer runs out: messages to targets
+		// connected only there are held meanwhile.
+		if n.isSuspect(id) && !p.probing && n.view.members[id] != nil {
+			p.probing = true
+			g := probeGet
+			n.call(id, &peerproto.Envelope{Get: &g}, func(*peerproto.Envelope, error) { p.probing = false })
+		}
 		if len(p.q) > 0 && p.inflight == 0 && !n.isSuspect(id) {
 			n.flush(p)
 		}

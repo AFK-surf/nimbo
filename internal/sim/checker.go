@@ -176,7 +176,10 @@ func (c *Checker) sendResult(rec *sendRec, out *wire.Out) {
 }
 
 // useResult checks the expiry bound and single use, and tracks last use.
-func (c *Checker) useResult(e *Endpoint, h *heldCap, out *wire.Out, kind useKind) {
+// The idle time is measured from when the request was sent: the Broker
+// checks the TTL on receipt, and a result can come much later (a durable
+// transfer waits up to 5s for replicas).
+func (c *Checker) useResult(e *Endpoint, h *heldCap, out *wire.Out, kind useKind, sentAt time.Duration) {
 	transfer := kind == useTransfer
 	now := c.w.now
 	if out == nil {
@@ -194,7 +197,7 @@ func (c *Checker) useResult(e *Endpoint, h *heldCap, out *wire.Out, kind useKind
 		return
 	}
 	bound := c.w.cfg.Tunables.CapTTL + c.w.cfg.Tunables.Grace + 5*time.Second
-	if idle := now - h.lastUse; idle > bound {
+	if idle := sentAt - h.lastUse; idle > bound {
 		c.violate("%s: cap %s accepted after %v idle", e.name, h.id, idle)
 	}
 	h.lastUse = now
@@ -206,13 +209,13 @@ func (c *Checker) useResult(e *Endpoint, h *heldCap, out *wire.Out, kind useKind
 	}
 }
 
-func (c *Checker) inspected(e *Endpoint, h *heldCap, out *wire.Out) {
+func (c *Checker) inspected(e *Endpoint, h *heldCap, out *wire.Out, sentAt time.Duration) {
 	if out == nil || !out.OK {
 		c.noteErr(out)
 		return
 	}
 	bound := c.w.cfg.Tunables.CapTTL + c.w.cfg.Tunables.Grace + 5*time.Second
-	if idle := c.w.now - h.lastUse; idle > bound {
+	if idle := sentAt - h.lastUse; idle > bound {
 		c.violate("%s: inspect accepted cap %s after %v idle", e.name, h.id, idle)
 	}
 	if out.Info == nil || out.Info.Holder != e.key.String() {
