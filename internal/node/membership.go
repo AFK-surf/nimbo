@@ -567,12 +567,17 @@ func (n *Node) sweepDrain() {
 	}
 	// Established streams get up to StreamDrainGrace, then close with
 	// 1001; their Brokers on the other side relay the close.
-	grace := n.now().Sub(n.drainStarted) >= n.tun.StreamDrainGrace
-	if grace && !n.streamDrain {
+	since := n.now().Sub(n.drainStarted)
+	if since >= n.tun.StreamDrainGrace && !n.streamDrain {
 		n.streamDrain = true
 		n.closeEstablishedStreams(wire.CloseDraining, wire.ReasonDraining)
 	}
-	idle := len(n.rejoinPending) == 0 && (len(n.legs) == 0 || n.streamDrain)
+	// Leave only once the closes went out (the runtime reports every leg
+	// closed), so the process does not cut them off; at most 5s more.
+	if len(n.legs) > 0 && since < n.tun.StreamDrainGrace+5*time.Second {
+		return
+	}
+	idle := len(n.rejoinPending) == 0
 	for _, id := range sortedBrokerKeys(n.peers) {
 		p := n.peers[id]
 		if len(p.q) > 0 || p.inflight > 0 {

@@ -419,9 +419,8 @@ func (n *Node) OnStreamDialed(l StreamLeg, st PeerStatus) {
 		n.env.AnswerAttach(hs.local, AttachOK)
 		n.splice(hs)
 		return
-	case PeerNoHalf, PeerBusy:
+	case PeerNoHalf:
 		n.env.AnswerAttach(hs.local, AttachForbidden)
-		n.env.CloseStreamLeg(l, wire.CloseUnavailable, wire.BounceUnavailable)
 	default:
 		n.env.AnswerAttach(hs.local, AttachUnavailable)
 	}

@@ -164,7 +164,7 @@ A stream is a full-duplex WebSocket pipe to the target of a cap with `allow_stre
 - **Refuse:** attach and close at once with code 4901 and a reason; the holder's socket closes with the same code and reason (its `stream_status` says `accepted`, since you attached).
 - **Ignore:** do nothing. The holder gets `peer_attach_timeout`.
 
-**Attach answers.** `101` attached; `400` not a `nimbo.stream.v1` WebSocket request; `401` unknown, used or expired token, or the wrong Broker; `403` the holder's side of the stream is gone; `429` too many sockets or failed attaches from your IP; `503` the other Broker is unreachable, or this Broker is fenced or draining. A token is single use: it is spent once its Broker finds it, whatever the outcome. A 400, a 429 or a 503 from a fenced or draining Broker leaves it unused.
+**Attach answers.** `101` attached; `400` not a `nimbo.stream.v1` WebSocket request; `401` unknown, used or expired token, or the wrong Broker; `403` the holder's side of the stream is gone; `429` too many sockets or failed attaches from your IP; `503` the other Broker is unreachable, fenced or draining, or this one is. A token is single use: it is spent once its Broker finds it, whatever the outcome. A 400, a 429 or a 503 from a fenced or draining Broker leaves it unused.
 
 **Close codes.**
 
