@@ -175,11 +175,9 @@ type validated struct {
 	base   *record
 }
 
-func (n *Node) validateCap(s *session, id ids.CapID, cb func(*validated, *capErr)) {
-	if !n.noteUse(s, id) {
-		cb(nil, cerr(wire.ErrRateLimited, "distinct caps"))
-		return
-	}
+// validateCap runs the checks every use of a cap shares. send marks a send
+// on the cap, which consumes a single-use cap.
+func (n *Node) validateCap(s *session, id ids.CapID, send bool, cb func(*validated, *capErr)) {
 	rk := capKey(id)
 	if n.recs[rk] == nil {
 		if s.unknown >= n.lim.UnknownPer10s {
@@ -207,6 +205,14 @@ func (n *Node) validateCap(s *session, id ids.CapID, cb func(*validated, *capErr
 		}
 		if r.consumed {
 			cb(nil, cerr(wire.ErrConsumed, ""))
+			return
+		}
+		// The distinct-caps quota bounds the Touches a session can cause. A
+		// send on a single-use cap consumes it instead, and such sends are
+		// bounded by the action rate: exempt them, or a responder could not
+		// answer as fast as a requester may create reply caps.
+		if !(send && r.cap.SingleUse) && !n.noteUse(s, id) {
+			cb(nil, cerr(wire.ErrRateLimited, "distinct caps"))
 			return
 		}
 		next := func(r *record) {
@@ -438,7 +444,7 @@ func (n *Node) actTransfer(s *session, in *wire.In) {
 		n.fail(s, in.Rid, e.code, e.detail)
 		return
 	}
-	n.validateCap(s, id, func(v *validated, e *capErr) {
+	n.validateCap(s, id, false, func(v *validated, e *capErr) {
 		if e != nil {
 			n.fail(s, in.Rid, e.code, e.detail)
 			return
@@ -500,7 +506,7 @@ func (n *Node) actRenew(s *session, in *wire.In) {
 			finish()
 			continue
 		}
-		n.validateCap(s, id, func(v *validated, e *capErr) {
+		n.validateCap(s, id, false, func(v *validated, e *capErr) {
 			if e != nil {
 				out[i].Error = &wire.Error{Code: e.code, Detail: e.detail}
 				finish()
@@ -528,7 +534,7 @@ func (n *Node) actInspect(s *session, in *wire.In) {
 		n.fail(s, in.Rid, wire.ErrBadRequest, "cap")
 		return
 	}
-	n.validateCap(s, id, func(v *validated, e *capErr) {
+	n.validateCap(s, id, false, func(v *validated, e *capErr) {
 		if e != nil {
 			n.fail(s, in.Rid, e.code, e.detail)
 			return

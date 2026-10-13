@@ -560,11 +560,16 @@ func benchReply(ctx context.Context, urls []string) {
 	ps := makePairs(ctx, urls, *flagPairs, true, 64)
 	defer closePairs(ps)
 	// Receivers answer every request on its single-use reply cap.
+	var replyErrs atomic.Int64
+	var firstReplyErr atomic.Value
 	for _, p := range ps {
 		go func(p *pair) {
 			for d := range p.rcv.in {
 				if d.Reply != "" {
-					p.rcv.c.Send(ctx, d.Reply, map[string]any{"ok": true, "t": sentAt(d).UnixNano()}, client.SendOptions{})
+					if _, err := p.rcv.c.Send(ctx, d.Reply, map[string]any{"ok": true, "t": sentAt(d).UnixNano()}, client.SendOptions{}); err != nil {
+						replyErrs.Add(1)
+						firstReplyErr.CompareAndSwap(nil, err.Error())
+					}
 				}
 			}
 		}(p)
@@ -595,4 +600,7 @@ func benchReply(ctx context.Context, urls []string) {
 	wg.Wait()
 	fmt.Printf("reply: %d pairs, one request in flight each, %v: %d round trips = %.0f req/s, %d lost\n  request→reply RTT (2 messages, 1 single-use cap): %s\n\n",
 		len(ps), flagDuration.Round(time.Second), done.Load(), float64(done.Load())/flagDuration.Seconds(), lost.Load(), rtt.summary())
+	if n := replyErrs.Load(); n > 0 {
+		fmt.Printf("  reply sends failed: %d (first: %v)\n\n", n, firstReplyErr.Load())
+	}
 }

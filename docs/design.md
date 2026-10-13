@@ -199,7 +199,7 @@ Requests carry a client-chosen `rid`. Each gets exactly one `result`: `{"op":"re
 
 - **Messages:** payload ≤ 64 KiB, and no larger than the receiver's `max_message_bytes`. Up to 16 carried caps per message.
 - **Blobs:** schema ≤ 32 KiB, base ≤ 4 KiB. New blob bytes (a schema or base not already live in the Cluster) ≤ 64 KiB per session per 10s.
-- **Per session:** 1000 actions/s and 100 mints/s. 4096 distinct caps used or renewed per 10s. 100 lookups of unknown cap IDs per 10s. At most 10k live caps created by the session through mint or transfer, counted by the issuing Broker.
+- **Per session:** 1000 actions/s and 100 mints/s. 4096 distinct caps used or renewed per 10s; sends on single-use caps are exempt, since they consume the cap instead of touching it and are bounded by the action rate. 100 lookups of unknown cap IDs per 10s. At most 10k live caps created by the session through mint or transfer, counted by the issuing Broker.
 - **Per client IP:** 64 concurrent sessions and 20 handshakes/s with a burst of 200, so a NAT'd fleet can reconnect after a Broker failure. Both are configurable, with an allowlist for known service networks.
 - **Per Broker:** a mint admission rate (default 20k records/s), and bounded per-peer replication queues. When either is exhausted, new mints, transfers and auto-reply sends fail with `unavailable`. Overload causes back-pressure, not unbounded memory.
 - **Queues:** the delivery queue is 1000 messages or 1 MiB per session. Held messages are capped at 100 per target per Broker.
@@ -456,7 +456,7 @@ The receiver gets `on` (which of its minted caps the message arrived on), the me
 - **Clock safety.** Wire durations are relative and clamped to `cap_ttl` on receipt, and membership liveness is judged in S3 time. Brokers with bad clocks fence themselves (§4).
 - **Permissionless DoS.** The limits in §6.4 apply per IP (PROXY protocol behind load balancers), per session, per created-cap quota and per Broker. Schema compilation is capped: schema ≤ 32 KiB, no remote `$ref`, compile time limited.
 - **Amplification bounds:**
-  - **Touches:** 4096 distinct caps per session per 10s.
+  - **Touches:** 4096 distinct caps per session per 10s. A send on a single-use cap consumes it rather than touching it, and is bounded by the action rate.
   - **Lookups:** 100 unknown IDs per session per 10s.
   - **Blobs:** 64 KiB of new bytes per session per 10s.
   - **Fast-join S3 GETs:** negative cache plus a global rate limit.

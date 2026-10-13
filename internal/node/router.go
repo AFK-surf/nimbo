@@ -151,7 +151,7 @@ func (n *Node) processSend(req *sendReq, done func()) {
 	if in.TTLms > 0 {
 		ttl = min(fromMs(in.TTLms), n.tun.MaxMsgTTL)
 	}
-	n.validateCap(s, req.capID, func(v *validated, e *capErr) {
+	n.validateCap(s, req.capID, true, func(v *validated, e *capErr) {
 		if e != nil {
 			failDone(e)
 			return
@@ -182,7 +182,7 @@ func (n *Node) validateCarried(s *session, idsIn []ids.CapID, cb func([]*validat
 	}
 	for i, id := range idsIn {
 		i := i
-		n.validateCap(s, id, func(v *validated, e *capErr) {
+		n.validateCap(s, id, false, func(v *validated, e *capErr) {
 			out[i] = v
 			if e != nil && firstErr == nil {
 				firstErr = e

@@ -1,11 +1,13 @@
 package node
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
 	"github.com/afk-surf/nimbo/internal/ids"
 	"github.com/afk-surf/nimbo/internal/peerproto"
+	"github.com/afk-surf/nimbo/pkg/wire"
 )
 
 // Relays carry a deadline as a relative TTL, so the receiver adds the
@@ -34,5 +36,35 @@ func TestRelayOfSameUseDoesNotExtend(t *testing.T) {
 	n.mergeWire(&w2)
 	if !r.deadline.After(dl) || r.origin != 9 {
 		t.Fatal("a later use did not extend the deadline")
+	}
+}
+
+// A responder answers each request on a fresh single-use reply cap. Those
+// sends must not count against the distinct-caps quota, or a responder
+// could not keep up with a requester creating reply caps within its own
+// limits. Other uses of distinct caps stay limited.
+func TestReplySendsBypassDistinctCapsQuota(t *testing.T) {
+	b := newBench(t, 3)
+	for _, n := range b.nodes {
+		n.lim.CapsUsedPer10s = 8
+	}
+	responder := b.connect(b.nodes[0])
+	requester := b.connect(b.nodes[1])
+	req := grant(responder, requester, true, "")
+	for i := 0; i < 20; i++ {
+		requester.mustReq(&wire.In{Op: "send", Cap: req, Payload: json.RawMessage(`{}`)})
+		if responder.lastDel.Reply == "" {
+			t.Fatalf("request %d: no reply cap", i)
+		}
+		responder.mustReq(&wire.In{Op: "send", Cap: responder.lastDel.Reply, Payload: json.RawMessage(`{}`)})
+		responder.lastDel = wire.Out{}
+	}
+	var caps []string
+	for i := 0; i < 9; i++ {
+		caps = append(caps, responder.mustReq(&wire.In{Op: "mint"}).Cap)
+	}
+	out := responder.mustReq(&wire.In{Op: "renew", Caps: caps})
+	if e := out.Renewed[8].Error; e == nil || e.Code != wire.ErrRateLimited {
+		t.Fatalf("ninth distinct cap renewed: %+v", out.Renewed[8])
 	}
 }
