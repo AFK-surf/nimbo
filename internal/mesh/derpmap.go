@@ -197,7 +197,9 @@ func (x *derpIndex) setOwn(dm *tailcfg.DERPMap) {
 // peers that chose it, never as this Broker's home.
 func (x *derpIndex) build(published []json.RawMessage) (*tailcfg.DERPMap, []tailcfg.DERPRegionID) {
 	ids := make([]tailcfg.DERPRegionID, len(published))
-	var dm *tailcfg.DERPMap
+	// Never nil, even without relays: with a nil map and no STUN result,
+	// magicsock ignores endpoint updates and never reports direct ones.
+	dm := &tailcfg.DERPMap{Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{}}
 	if x.own != nil {
 		dm = x.own.Clone()
 	}
@@ -236,9 +238,6 @@ func (x *derpIndex) build(published []json.RawMessage) (*tailcfg.DERPMap, []tail
 			x.peer[key] = id
 		}
 		ids[i] = id
-		if dm == nil {
-			dm = &tailcfg.DERPMap{Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{}}
-		}
 		if dm.Regions[id] == nil {
 			r.RegionID, r.Avoid, r.NoMeasureNoHome = id, false, true
 			if r.RegionCode == "" {

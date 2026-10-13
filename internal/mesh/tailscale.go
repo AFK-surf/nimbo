@@ -212,9 +212,9 @@ func NewTS(cfg TSConfig) (*TS, error) {
 			return nil, err
 		}
 		t.derp.setOwn(cfg.DERPMap)
-		dm, _ := t.derp.build(nil)
-		t.ms.SetDERPMap(dm)
 	}
+	dm, _ := t.derp.build(nil)
+	t.ms.SetDERPMap(dm)
 	t.reportLocal()
 	return t, nil
 }
@@ -355,10 +355,8 @@ func (t *TS) SetPeers(members []node.Member) {
 	t.members = members
 	dm, regions := t.derp.build(published)
 	t.mu.Unlock()
-	if dm != nil {
-		// Before the peers: their home regions must be in the map.
-		t.ms.SetDERPMap(dm)
-	}
+	// Before the peers: their home regions must be in the map.
+	t.ms.SetDERPMap(dm)
 	var peers []tailcfg.NodeView
 	byKey := map[key.NodePublic]ids.BrokerID{}
 	byIP := map[netip.Addr]key.NodePublic{}
