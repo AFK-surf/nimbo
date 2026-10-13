@@ -3,6 +3,7 @@ package mesh
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/netip"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"golang.org/x/crypto/curve25519"
+	"tailscale.com/tailcfg"
 
 	"github.com/afk-surf/nimbo/internal/ids"
 	"github.com/afk-surf/nimbo/internal/node"
@@ -26,6 +28,12 @@ type tsNode struct {
 }
 
 func newTSNode(t *testing.T, psk []byte) *tsNode {
+	return newTSNodeDERP(t, psk, nil, nil)
+}
+
+// newTSNodeDERP starts a node choosing its home relay from dm, calling
+// unknown when WireGuard hears from a node it does not know.
+func newTSNodeDERP(t *testing.T, psk []byte, dm *tailcfg.DERPMap, unknown func(ids.BrokerID)) *tsNode {
 	t.Helper()
 	var priv [32]byte
 	rand.Read(priv[:])
@@ -36,15 +44,18 @@ func newTSNode(t *testing.T, psk []byte) *tsNode {
 	copy(n.pub[:], pub)
 	n.id = ids.BrokerIDFromPub(pub)
 	ts, err := NewTS(TSConfig{
-		NodePrivate: priv,
-		PSK:         psk,
-		Logf:        func(f string, a ...any) { t.Logf("[%s] "+f, append([]any{n.id.Abbrev()}, a...)...) },
-		OnLocalInfo: func(disco string, eps []string, home int) {
+		NodePrivate:   priv,
+		PSK:           psk,
+		Logf:          func(f string, a ...any) { t.Logf("[%s] "+f, append([]any{n.id.Abbrev()}, a...)...) },
+		OnUnknownPeer: unknown,
+		DERPMap:       dm,
+		OnLocalInfo: func(disco string, eps []string, derp json.RawMessage) {
 			n.mu.Lock()
 			n.info.DiscoPub = disco
 			n.info.Endpoints = eps
+			n.info.DERP = derp
 			n.mu.Unlock()
-			if len(eps) == 0 {
+			if len(eps) == 0 || (dm != nil && derp == nil) {
 				return
 			}
 			select {
@@ -141,4 +152,73 @@ func TestTSMeshLoopback(t *testing.T) {
 		}
 	}
 	t.Fatalf("no connection over the mesh: %v", err)
+}
+
+// Each Broker chooses its own relay and publishes it. With no direct
+// endpoints advertised, two Brokers on different relays must reach each
+// other through the relay the other one published.
+func TestTSMeshThroughPublishedRelays(t *testing.T) {
+	if testing.Short() {
+		t.Skip("uses Tailscale's public DERP relays")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	dm, err := fetchDERPMap(ctx, DefaultDERPMapURL)
+	cancel()
+	if err != nil {
+		t.Skipf("no access to Tailscale's DERP map: %v", err)
+	}
+	only := func(id tailcfg.DERPRegionID) *tailcfg.DERPMap {
+		r := dm.Regions[id]
+		if r == nil {
+			t.Skipf("Tailscale's DERP map has no region %d", id)
+		}
+		return &tailcfg.DERPMap{Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{id: r}}
+	}
+	psk := make([]byte, 32)
+	rand.Read(psk)
+	a := newTSNodeDERP(t, psk, only(1), nil)  // nyc
+	b := newTSNodeDERP(t, psk, only(12), nil) // ord
+	for _, n := range []*tsNode{a, b} {
+		select {
+		case <-n.got:
+		case <-time.After(20 * time.Second):
+			t.Skip("no DERP home region chosen (relays unreachable?)")
+		}
+	}
+	relayOnly := func(n *tsNode) node.Member {
+		m := n.member()
+		m.Info.Endpoints = nil
+		return m
+	}
+	ms := []node.Member{relayOnly(a), relayOnly(b)}
+	a.ts.SetPeers(ms)
+	b.ts.SetPeers(ms)
+	go func() {
+		c, _, err := a.ts.Accept()
+		if err == nil {
+			io.Copy(c, c)
+		}
+	}()
+	ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	var lastErr error
+	for ctx.Err() == nil {
+		dctx, dcancel := context.WithTimeout(ctx, 5*time.Second)
+		c, err := b.ts.Dial(dctx, a.id)
+		dcancel()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		c.Write([]byte("ping!"))
+		buf := make([]byte, 5)
+		c.SetReadDeadline(time.Now().Add(5 * time.Second))
+		_, err = io.ReadFull(c, buf)
+		c.Close()
+		if err == nil && string(buf) == "ping!" {
+			return
+		}
+		lastErr = err
+	}
+	t.Fatalf("no connection through the published relays: %v", lastErr)
 }

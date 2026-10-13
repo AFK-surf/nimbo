@@ -39,11 +39,14 @@ import (
 	"github.com/afk-surf/nimbo/internal/s3store"
 	"github.com/afk-surf/nimbo/pkg/client"
 	"github.com/afk-surf/nimbo/pkg/wire"
+
+	"tailscale.com/tailcfg"
 )
 
 var (
 	flagBrokers  = flag.Int("brokers", 3, "in-process Brokers")
 	flagMesh     = flag.String("mesh", "tcp", "in-process mesh: tcp or tailscale")
+	flagDERP     = flag.String("derp-map", "", "tailscale mesh: DERP map URL or file every Broker chooses its relay from (default: Tailscale's public relays), or none")
 	flagURLs     = flag.String("urls", "", "comma-separated wss:// URLs of an existing cluster (skips the in-process cluster)")
 	flagPairs    = flag.Int("pairs", 32, "sender/receiver endpoint pairs")
 	flagWindow   = flag.Int("window", 16, "messages in flight per pair (throughput)")
@@ -153,6 +156,21 @@ func startCluster(n int, meshKind string) ([]string, func()) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
 	var urls []string
 	var closers []func()
+	// Every Broker chooses its home relay from the same map here; in a
+	// Cluster each Broker may choose its own.
+	var derpMap *tailcfg.DERPMap
+	if meshKind == "tailscale" && *flagDERP != "none" {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		dm, err := mesh.LoadDERPMap(ctx, *flagDERP)
+		cancel()
+		if dm == nil {
+			must(err)
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "nimbo-bench: using the built-in DERP map:", err)
+		}
+		derpMap = dm
+	}
 	for i := 0; i < n; i++ {
 		k, err := config.GenerateNodeKey()
 		must(err)
@@ -186,12 +204,12 @@ func startCluster(n int, meshKind string) ([]string, func()) {
 				NodePrivate:   k.Private,
 				PSK:           psk,
 				OnUnknownPeer: func(id ids.BrokerID) { withHost(func(h *host.Host) { h.UnknownPeer(id) }) },
-				OnLocalInfo: func(d string, eps []string, _ int) {
+				OnLocalInfo: func(d string, eps []string, derp json.RawMessage) {
 					disco = d
 					withHost(func(h *host.Host) {
 						h.Do(func() {
 							h.Node().UpdateMemberInfo(func(mi *node.MemberInfo) {
-								mi.DiscoPub = d
+								mi.DiscoPub, mi.DERP = d, derp
 								if len(eps) > 0 {
 									mi.Endpoints = eps
 								}
@@ -199,6 +217,7 @@ func startCluster(n int, meshKind string) ([]string, func()) {
 						})
 					})
 				},
+				DERPMap: derpMap,
 			})
 			must(err)
 			hm, endpoints = ts, []string{fmt.Sprintf("127.0.0.1:%d", ts.LocalPort())}

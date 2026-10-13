@@ -3,6 +3,7 @@ package mesh
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -31,6 +32,9 @@ import (
 
 	"github.com/afk-surf/nimbo/internal/ids"
 	"github.com/afk-surf/nimbo/internal/node"
+
+	// DERP connections honor HTTPS_PROXY, for Brokers behind an egress proxy.
+	_ "tailscale.com/feature/useproxy"
 )
 
 // PeerPort is the peer RPC port inside the netstack (design §5).
@@ -60,8 +64,12 @@ type TSConfig struct {
 	// not a member (fast join, design §4).
 	OnUnknownPeer func(ids.BrokerID)
 	// OnLocalInfo reports this Broker's disco key, current UDP endpoints and
-	// home DERP region, for its member object.
-	OnLocalInfo func(disco string, endpoints []string, homeDERP int)
+	// home DERP region (as published in its member object, nil if none).
+	OnLocalInfo func(disco string, endpoints []string, derp json.RawMessage)
+	// DERPMap holds the DERP relays this Broker may use as its home region
+	// (see LoadDERPMap and RelayMap). Nil means this Broker has no relay of
+	// its own; it can still reach peers through theirs.
+	DERPMap *tailcfg.DERPMap
 }
 
 // TS is the production mesh: magicsock + userspace wireguard-go + gVisor
@@ -86,6 +94,8 @@ type TS struct {
 	disco    map[key.NodePublic]key.DiscoPublic
 	endpts   []string
 	homeDERP int
+	derp     derpIndex
+	members  []node.Member // last SetPeers
 }
 
 type accepted struct {
@@ -196,6 +206,15 @@ func NewTS(cfg TSConfig) (*TS, error) {
 	eng.SetSelfNode(selfNode)
 	ns.UpdateNetstackIPs(&netmap.NetworkMap{SelfNode: selfNode})
 	t.ms.SetNetworkMap(selfNode, nil)
+	if cfg.DERPMap != nil {
+		if err := checkOwnMap(cfg.DERPMap); err != nil {
+			eng.Close()
+			return nil, err
+		}
+		t.derp.setOwn(cfg.DERPMap)
+		dm, _ := t.derp.build(nil)
+		t.ms.SetDERPMap(dm)
+	}
 	t.reportLocal()
 	return t, nil
 }
@@ -231,9 +250,14 @@ func (t *TS) reportLocal() {
 	dk, _ := t.ms.DiscoPublicKey().MarshalText()
 	t.mu.Lock()
 	eps := append([]string(nil), t.endpts...)
-	home := t.homeDERP
+	var derp json.RawMessage
+	if t.derp.own != nil {
+		if r := t.derp.own.Regions[tailcfg.DERPRegionID(t.homeDERP)]; r != nil {
+			derp = publishedRegion(r)
+		}
+	}
 	t.mu.Unlock()
-	t.cfg.OnLocalInfo(string(dk), eps, home)
+	t.cfg.OnLocalInfo(string(dk), eps, derp)
 }
 
 // filter admits peer RPC traffic from mesh addresses to this Broker only.
@@ -318,32 +342,28 @@ func (t *TS) Dial(ctx context.Context, to ids.BrokerID) (net.Conn, error) {
 	return c, nil
 }
 
-// SetPeers implements host.Mesh: it rebuilds the WireGuard peer set, the
-// magicsock peer list and the DERP map from membership.
+// SetPeers implements host.Mesh: it rebuilds the WireGuard peer set and the
+// magicsock peer list from membership.
 func (t *TS) SetPeers(members []node.Member) {
+	published := make([]json.RawMessage, len(members))
+	for i, m := range members {
+		if m.ID != t.self {
+			published[i] = m.Info.DERP
+		}
+	}
+	t.mu.Lock()
+	t.members = members
+	dm, regions := t.derp.build(published)
+	t.mu.Unlock()
+	if dm != nil {
+		// Before the peers: their home regions must be in the map.
+		t.ms.SetDERPMap(dm)
+	}
 	var peers []tailcfg.NodeView
 	byKey := map[key.NodePublic]ids.BrokerID{}
 	byIP := map[netip.Addr]key.NodePublic{}
 	disco := map[key.NodePublic]key.DiscoPublic{}
-	dm := &tailcfg.DERPMap{Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{}}
-	for _, m := range members {
-		if d := m.Info.DERP; d != nil && d.RegionID > 0 {
-			rid := tailcfg.DERPRegionID(d.RegionID)
-			r := dm.Regions[rid]
-			if r == nil {
-				r = &tailcfg.DERPRegion{RegionID: rid, RegionCode: d.RegionCode, RegionName: d.RegionCode}
-				dm.Regions[rid] = r
-			}
-			r.Nodes = append(r.Nodes, &tailcfg.DERPNode{
-				Name:     m.ID.Abbrev(),
-				RegionID: rid,
-				HostName: d.HostName,
-				IPv4:     d.IPv4,
-				IPv6:     d.IPv6,
-				STUNPort: d.STUNPort,
-				DERPPort: d.DERPPort,
-			})
-		}
+	for i, m := range members {
 		if m.ID == t.self {
 			continue
 		}
@@ -375,7 +395,7 @@ func (t *TS) SetPeers(members []node.Member) {
 			Addresses:         []netip.Prefix{pfx},
 			AllowedIPs:        []netip.Prefix{pfx},
 			Endpoints:         eps,
-			HomeDERP:          tailcfg.DERPRegionID(m.Info.HomeDERP),
+			HomeDERP:          regions[i],
 			MachineAuthorized: true,
 		}
 		peers = append(peers, n.View())
@@ -383,14 +403,10 @@ func (t *TS) SetPeers(members []node.Member) {
 		byIP[ip] = k
 		disco[k] = dk
 	}
-	for _, r := range dm.Regions {
-		sort.Slice(r.Nodes, func(i, j int) bool { return r.Nodes[i].Name < r.Nodes[j].Name })
-	}
 	t.mu.Lock()
 	old, oldDisco := t.byKey, t.disco
 	t.byKey, t.byIP, t.disco = byKey, byIP, disco
 	t.mu.Unlock()
-	t.ms.SetDERPMap(dm)
 	t.ms.SetNetworkMap(t.selfNode().View(), peers)
 	for k := range old {
 		if _, ok := byKey[k]; !ok {
@@ -403,6 +419,21 @@ func (t *TS) SetPeers(members []node.Member) {
 			t.eng.MarkDevicePeerForHandshake(k)
 		}
 	}
+}
+
+// SetDERPMap replaces this Broker's own DERP relays, e.g. after a periodic
+// refresh.
+func (t *TS) SetDERPMap(dm *tailcfg.DERPMap) error {
+	if err := checkOwnMap(dm); err != nil {
+		return err
+	}
+	t.mu.Lock()
+	t.derp.setOwn(dm)
+	members := t.members
+	t.mu.Unlock()
+	t.SetPeers(members)
+	t.reportLocal()
+	return nil
 }
 
 // LocalPort is magicsock's UDP port.

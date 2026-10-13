@@ -106,10 +106,9 @@ func LoadNodeKey(stateDir string) (k NodeKey, source string, err error) {
 
 // Cluster is cluster.json.
 type Cluster struct {
-	ClusterID   string `json:"cluster_id"`
-	WGPSK       string `json:"wg_psk"`        // hex, 32 bytes
-	DERPMeshKey string `json:"derp_mesh_key"` // hex, 32 bytes
-	Version     int    `json:"version"`
+	ClusterID string `json:"cluster_id"`
+	WGPSK     string `json:"wg_psk"` // hex, 32 bytes
+	Version   int    `json:"version"`
 	// Mesh is "tailscale" (default) or "tcp" (development only).
 	Mesh string `json:"mesh,omitempty"`
 }
@@ -117,13 +116,13 @@ type Cluster struct {
 // NewCluster creates a cluster.json with fresh secrets.
 func NewCluster(mesh string) (*Cluster, error) {
 	var id [16]byte
-	var psk, dk [32]byte
-	for _, b := range [][]byte{id[:], psk[:], dk[:]} {
+	var psk [32]byte
+	for _, b := range [][]byte{id[:], psk[:]} {
 		if _, err := rand.Read(b); err != nil {
 			return nil, err
 		}
 	}
-	return &Cluster{ClusterID: hex.EncodeToString(id[:]), WGPSK: hex.EncodeToString(psk[:]), DERPMeshKey: hex.EncodeToString(dk[:]), Version: 1, Mesh: mesh}, nil
+	return &Cluster{ClusterID: hex.EncodeToString(id[:]), WGPSK: hex.EncodeToString(psk[:]), Version: 1, Mesh: mesh}, nil
 }
 
 // ParseCluster parses and validates cluster.json.

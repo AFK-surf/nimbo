@@ -59,7 +59,7 @@ Status: revision 6, implemented in this repository. Revision 5 incorporated the 
  │   nimbod  A    ││  nimbod B  │ │  nimbod C   │   Brokers (fully trusted)
  │ ws API │router ││            │ │             │
  │ caps   │RCR    ││            │ │             │
- │ mesh (magicsock + wireguard-go + gVisor netstack, embedded DERP)
+ │ mesh (magicsock + wireguard-go + gVisor netstack; DERP relays are external)
  └───────┬────────┘└─────┬──────┘ └──────┬──────┘
          └─── WireGuard over UDP / DERP ─┘
                          │
@@ -85,8 +85,8 @@ Bucket layout under a configured prefix `s3://<bucket>/<prefix>/`:
 
 | Key | Content | Writer |
 |---|---|---|
-| `cluster.json` | `cluster_id`, `wg_psk` (32B), `derp_mesh_key`, protocol version, cluster-wide tunables. | Created once by `nimbod init` with a conditional `If-None-Match: *` PUT. Read by every Broker at startup. |
-| `members/<broker-id-hex>.json` | `node_pub`, `disco_pub`, `incarnation` (random nonce), `draining` (bool), `version`, `ws_urls[]`, `derp` (region ID/code, hostname, IPv4/IPv6, STUN port) if this Broker serves DERP, `region`. | That Broker only. |
+| `cluster.json` | `cluster_id`, `wg_psk` (32B), protocol version, cluster-wide tunables. | Created once by `nimbod init` with a conditional `If-None-Match: *` PUT. Read by every Broker at startup. |
+| `members/<broker-id-hex>.json` | `node_pub`, `disco_pub`, `incarnation` (random nonce), `draining` (bool), `version`, `ws_urls[]`, `endpoints[]` (direct mesh endpoints), `derp` (the DERP relay region this Broker chose as its home: hostnames, ports, as a Tailscale `DERPRegion` without its ID), `region`. | That Broker only. |
 
 - **Clock reference.** Every S3 response carries a `Date` header. The Broker keeps a smoothed offset `s3_offset = Date − local midpoint of the request`, accurate to about ±1s. **S3 time** is `local now + s3_offset`. All membership liveness is judged in S3 time. If `|s3_offset|` exceeds `max_skew` (3s), the Broker fences itself (below) until NTP fixes the clock.
 - **Heartbeat.** Each Broker re-PUTs its member object every `member_heartbeat` (15s). The content holds no timestamps, so the ETag stays the same and only `LastModified` moves.
@@ -98,7 +98,7 @@ Bucket layout under a configured prefix `s3://<bucket>/<prefix>/`:
   - it stops acting as a write target.
 
   Its endpoints move to healthy Brokers before peers declare it dead, so it never becomes a black hole. Fencing lifts once heartbeats succeed and the clock is within bounds again. **(rev 6)** On unfencing, the Broker takes a **new incarnation** and announces it (heartbeat PUT and `Rejoin`), exactly as after a restart: peers may have declared it dead meanwhile and tombstoned its registers, and nothing written under the old incarnation may shadow new state.
-- **Fast join.** When the mesh sees a handshake from an unknown node key, the Broker GETs `members/<SHA-256(key)>.json`. If the object exists and is fresh, the peer is added at once; existence in S3 is the admission check.
+- **Fast join.** When the mesh sees a handshake from an unknown node key, the Broker GETs `members/<SHA-256(key)>.json`. If the object exists and is fresh, the peer is added at once; existence in S3 is the admission check. Only the TCP development mesh reports unknown keys: magicsock drops their packets before WireGuard sees them (§5).
   - **Abuse limits:** misses are cached negatively for 60s, and fast-join GETs are globally rate limited (10/s per Broker). Random handshake attempts therefore cannot amplify S3 load.
 - **Rejoin announce.** On start, after writing its member object, a Broker sends `Rejoin{incarnation}` to every live member. This updates their views at once and triggers handoff to it (§7.4).
   - **(rev 6)** An incarnation learned from a `Rejoin` (or from any peer frame, which carries the sender's incarnation) is kept until an S3 member object **newer** than that moment says otherwise; a LIST/GET that still returns the old object must not roll the view back.
@@ -110,7 +110,7 @@ Bucket layout under a configured prefix `s3://<bucket>/<prefix>/`:
   4. DELETE the member object.
 - **Cost** at 100 Brokers is about 8.6M LISTs plus 17M heartbeat PUTs a month, about $130. Any S3-compatible store works (AWS, R2, MinIO, GCS through its S3 API), with `aws-sdk-go-v2`.
 
-**Trust model.** Write access to the prefix is cluster admin. `cluster.json` holds the WireGuard pre-shared key and the DERP mesh key.
+**Trust model.** Write access to the prefix is cluster admin. `cluster.json` holds the WireGuard pre-shared key.
 
 Membership is the input to every placement decision. Brokers can disagree on it for up to one poll interval, or less after a Rejoin. Lookups, write fallbacks and handoff (§7) are designed to absorb that.
 
@@ -128,7 +128,12 @@ This follows tailcat's approach: Tailscale's open-source data plane used directl
 
   An invalid `NIMBOD_NODE_KEY` is a fatal startup error; it never falls back silently. `nimbod keygen` prints a new key. The disco key is regenerated on every start, as in Tailscale.
 - **Addressing.** Each Broker gets a ULA IPv6 `/128` derived from its Broker ID (`fd4e:6d62:6f00::/40` + 88 bits of the ID). The WireGuard peer configuration is rebuilt from membership whenever it changes. Every peer gets `wg_psk` as its pre-shared key, which protects against a DERP operator or anyone holding only public keys, and adds post-quantum protection.
-- **DERP, embedded in `nimbod`.** A Broker configured with a public hostname and a TLS certificate serves DERP at `/derp` on its HTTPS listener (the endpoint WebSocket listener can share it) and STUN on UDP 3478. It advertises itself in its member object. Every Broker builds the same DERP map from membership: relay Brokers with the same configured `region_id` form one DERP region and mesh with each other using `derp_mesh_key`. Brokers without public reachability are DERP clients only. A Cluster needs at least one relay Broker. If all Brokers can reach each other directly over UDP, DERP is used only for rendezvous.
+- **DERP relays are external; Brokers do not relay.** Each Broker chooses its own relays: by default Tailscale's public relays (the map at `controlplane.tailscale.com/derpmap/default`, with a copy built into the binary as a fallback), or `-derp-map` (a map URL or file) or `-derp-relay host[:port]` (one relay, e.g. a self-hosted `derper`). `-derp-insecure` skips TLS certificate verification for them.
+  - magicsock measures the Broker's relays and picks the nearest as its home. The Broker publishes that region (its nodes, without an ID) as `derp` in its member object.
+  - Each Broker's DERP map is its own relays plus every region its peers publish. Region IDs are local to that map. A published region identical to one of the Broker's own keeps that region's ID; any other gets a stable local ID of 40000 or above and is marked `NoMeasureNoHome`, so it is used only to reach the peers that chose it. Each peer's home region is set from its published one.
+  - A published opt-out of certificate verification travels with the region, since peers dial that relay too.
+  - If Brokers can reach each other directly over UDP, DERP is used only for rendezvous. DERP connections honor `HTTPS_PROXY`.
+  - magicsock drops packets, relayed or direct, from node keys it does not know. A Broker therefore learns about a joiner from S3 or the joiner's Rejoin, never from the joiner's first packets.
 - **Connections.** Peer RPC listens on TCP `[ula]:7946` inside the netstack. Links are opened lazily to any Broker that needs to be reached and closed after `link_idle` (2 min). Each link uses two TCP streams: one for messages (`Forward`) and one for RCR traffic, so that a handoff burst cannot hold up messages.
 - **Suspicion.** A peer becomes **suspect** locally when a dial fails or an RPC gets no reply within `rpc_timeout` (2s). Suspicion lasts 10s, doubling on each repeat up to 2 min, and clears on the first successful RPC.
   - Suspect peers are skipped as write targets (§7.2) and queried last on reads.
@@ -474,7 +479,6 @@ internal/config/            config file + flags, cluster.json model
 internal/membership/        S3 member objects, poll/heartbeat, freeze-on-failure, self-fencing,
                             S3 clock offset, fast-join GET (+ negative cache), Rejoin, draining, change events
 internal/mesh/              magicsock + wireguard-go + netstack wiring, ULA addressing, peer dial/listen, suspicion
-internal/derpsrv/           embedded DERP server + STUN, DERP map from membership
 internal/peerproto/         protobuf messages + framing, per-link coalescing, acked retry queues
 internal/rcr/               virtual-ID placement index, record stores per kind, merge rules,
                             Store/Get/Touch/missing, hinted copies, lookup outcomes, LRU caches, handoff, expiry
@@ -500,7 +504,7 @@ docs/protocol.md            endpoint wire protocol spec, for the ESP32 / Elixir 
 
 The deterministic simulator (`internal/sim`, [dst.md](dst.md)) drives the same `node` code. If one loop per Broker becomes the bottleneck, JSON parsing, schema validation and X25519 can move to the session goroutines without touching the state machine's semantics.
 
-**Package layout as built (rev 6):** the subsystems above are files of `internal/node` (`membership.go`, `peers.go`, `store.go`, `presence.go`, `caps.go`, `router.go`, `session.go`) rather than separate packages, since they share one loop. Pure pieces are packages: `ids`, `placement`, `caprec` (the cap record; `cap` is a Go builtin), `presence` (registers and classification), `peerproto`, `schema`, `config`. I/O: `s3store`, `mesh` (`TS`: Tailscale data plane; `TCP`: a PSK-authenticated, unencrypted development transport selected by `"mesh":"tcp"` in `cluster.json`), `derpsrv`, `host`. Tools: `cmd/nimbod`, `cmd/nimbo-sim`.
+**Package layout as built (rev 6):** the subsystems above are files of `internal/node` (`membership.go`, `peers.go`, `store.go`, `presence.go`, `caps.go`, `router.go`, `session.go`) rather than separate packages, since they share one loop. Pure pieces are packages: `ids`, `placement`, `caprec` (the cap record; `cap` is a Go builtin), `presence` (registers and classification), `peerproto`, `schema`, `config`. I/O: `s3store`, `mesh` (`TS`: Tailscale data plane, with each Broker's DERP map; `TCP`: a PSK-authenticated, unencrypted development transport selected by `"mesh":"tcp"` in `cluster.json`), `host`. Tools: `cmd/nimbod`, `cmd/nimbo-sim`.
 
 **Observability:** each Broker exposes Prometheus metrics for its stores, retry-queue depth, hinted copies, suspicion, S3 offset and fencing, plus `/debug` endpoints. `nimbod ctl` builds cluster-wide views by listing members from S3 and querying each Broker.
 
@@ -521,7 +525,7 @@ The deterministic simulator (`internal/sim`, [dst.md](dst.md)) drives the same `
 ## 12. Milestones
 
 1. **Single broker:** WebSocket API, handshake, mint/transfer/renew/send, cap records and expiry, single-use reply caps, blobs, Go SDK. The RCR store runs with a membership of one.
-2. **Mesh + membership:** S3 membership with the clock offset, freeze-on-failure and fencing; magicsock mesh with suspicion; embedded DERP; Forward between Brokers.
+2. **Mesh + membership:** S3 membership with the clock offset, freeze-on-failure and fencing; magicsock mesh with suspicion; external DERP relays chosen per Broker and published in membership; Forward between Brokers.
 3. **Distributed RCR:** virtual-ID placement; acked Store/Touch with retries, hinted copies and `missing`; lookups with outcomes; presence registers with watches and read repair; handoff; Rejoin; draining.
 4. **Hardening:** all limits and quotas, PROXY protocol, metrics and `nimbod ctl`, chaos and churn tests, protocol spec for third-party SDKs (ESP32 C, Elixir).
 
@@ -538,7 +542,7 @@ Decided with the project owner on 2026-10-12:
 | D3 | Consistency of the sliding deadline | **Soft expiry**: touch at ≥10s extension, 15s grace (60–75s effective). Touches go to the record's placement set. |
 | D4 | Withdrawing access | **No revocation.** The target endpoint rotates its key. |
 | D5 | Delivery guarantee | **At-most-once + TTL** (default 10s, max 60s), FIFO per path, best-effort bounces |
-| D6 | DERP relays | **Embedded in `nimbod`**, DERP map built from S3 membership |
+| D6 | DERP relays | ~~Embedded in `nimbod`~~. Revised 2026-10-13: **Brokers do not relay.** Each Broker chooses its own external relays (default: Tailscale's public relays) and publishes its home relay in its member object; peers add it to their DERP maps. |
 | D7 | Payload model | **JSON object only.** JSON text frames for all Actions. |
 | D8 | Scale target | **~100 Brokers / ~1M endpoints / ~1M live caps** |
 | D9 | Where schema and base live | **Not in the token.** Content-addressed blobs referenced by hash; placement per D15. |
