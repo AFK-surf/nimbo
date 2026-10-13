@@ -1,0 +1,7 @@
+.git
+.github
+sdk
+docs
+*.md
+!go.mod
+!go.sum

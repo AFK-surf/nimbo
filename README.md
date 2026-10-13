@@ -33,6 +33,8 @@ NIMBOD_NODE_KEY=privkey:... nimbod run -bucket my-bucket -prefix prod \
 nimbod ctl members -bucket my-bucket -prefix prod
 ```
 
+A `Dockerfile` builds a small image with `nimbod` as its entrypoint (`docker build -t nimbod .`, then `docker run nimbod run ...` with the same flags; the node key can come from `NIMBOD_NODE_KEY`).
+
 Behind a TLS-terminating load balancer, omit `-tls-*` and add `-proxy-protocol` (the load balancer must send PROXY protocol v2). Metrics, `/healthz` and `/debug/stats` are on `-metrics-listen` (default `127.0.0.1:9090`). With the Tailscale mesh, `/debug/stats` lists each peer Broker under `MeshPeers`: whether it is reached directly over UDP (and at which address) or through a DERP relay (and which region), the last WireGuard handshake and byte counts; `/debug/stats?ping` also disco-pings each peer and adds the round trip. Brokers relay through Tailscale's public DERP relays by default; `-derp-relay host[:port]` (e.g. a self-hosted `derper`, with `-derp-insecure` for a self-signed certificate) or `-derp-map url|file` chooses others per Broker. For local development without UDP, `nimbod init -mesh tcp` selects an unencrypted TCP mesh (use `-mesh-advertise ip:port`).
 
 ## Using it from Go
