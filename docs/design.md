@@ -86,11 +86,15 @@ Bucket layout under a configured prefix `s3://<bucket>/<prefix>/`:
 | Key | Content | Writer |
 |---|---|---|
 | `cluster.json` | `cluster_id`, `wg_psk` (32B), protocol version, cluster-wide tunables. | Created once by `nimbod init` with a conditional `If-None-Match: *` PUT. Read by every Broker at startup. |
+| `members.signal` | A random token. Its ETag changes whenever any member object's content changes. | Any Broker, after it joined, changed its member object or left. |
 | `members/<broker-id-hex>.json` | `node_pub`, `disco_pub`, `incarnation` (random nonce), `draining` (bool), `version`, `ws_urls[]`, `endpoints[]` (direct mesh endpoints), `derp` (the DERP relay region this Broker chose as its home: hostnames, ports, as a Tailscale `DERPRegion` without its ID), `region`. | That Broker only. |
 
 - **Clock reference.** Every S3 response carries a `Date` header. The Broker keeps a smoothed offset `s3_offset = Date − local midpoint of the request`, accurate to about ±1s. **S3 time** is `local now + s3_offset`. All membership liveness is judged in S3 time. If `|s3_offset|` exceeds `max_skew` (3s), the Broker fences itself (below) until NTP fixes the clock.
 - **Heartbeat.** Each Broker re-PUTs its member object every `member_heartbeat` (15s). The content holds no timestamps, so the ETag stays the same and only `LastModified` moves.
-- **Discovery.** Each Broker LISTs `members/` every `member_poll` (30s). It GETs an object only when its ETag changed. A member is dead when `S3 time − LastModified > member_ttl` (60s).
+- **Discovery.** A full refresh LISTs `members/` and GETs an object only when its ETag changed. A member is dead when `S3 time − LastModified > member_ttl` (60s).
+  - **Membership signal (rev 7).** After a Broker's member object PUT changes its content (joining, a restart's new incarnation, new endpoints or DERP relay, draining) or after it DELETEs it on leaving, it PUTs `members.signal` with a random token, so the ETag changes. An empty object would not work: its ETag is always the MD5 of nothing.
+  - Every Broker GETs `members.signal` every `member_signal_poll` (5s) and runs a full refresh when the ETag differs from the last one it saw (or right after a refresh in flight, whose LIST may predate the change). It does not record its own writes as seen, so a change signalled just before its own is not missed. Joins, leaves and info changes therefore reach every Broker within about 5s, without the mesh, which matters because over the Tailscale mesh a joiner's packets are dropped until peers know its key (§5).
+  - A crashed Broker cannot signal, so the full refresh also runs every `member_poll` (30s) as a backstop. Heartbeats that only move `LastModified` do not signal.
   - **Freeze on failure:** if a LIST fails, the Broker keeps its last membership view and expires **nobody** until a LIST succeeds.
 - **Self-fencing.** If a Broker's own last successful heartbeat is older than `member_ttl − 15s` (S3 time), or its clock is out of bounds (`|s3_offset| > max_skew`, using the median of the last 5 offset samples **(rev 6)**):
   - it sends `closing` with a jittered `retry_after_ms` to all its sessions;
@@ -108,11 +112,11 @@ Bucket layout under a configured prefix `s3://<bucket>/<prefix>/`:
   2. Send `closing` to sessions.
   3. Hand off all records (§7.4).
   4. DELETE the member object.
-- **Cost** at 100 Brokers is about 8.6M LISTs plus 17M heartbeat PUTs a month, about $130. Any S3-compatible store works (AWS, R2, MinIO, GCS through its S3 API), with `aws-sdk-go-v2`.
+- **Cost** at 100 Brokers is about 8.6M LISTs, 17M heartbeat PUTs and 52M signal GETs a month, about $150. Any S3-compatible store works (AWS, R2, MinIO, GCS through its S3 API), with `aws-sdk-go-v2`.
 
 **Trust model.** Write access to the prefix is cluster admin. `cluster.json` holds the WireGuard pre-shared key.
 
-Membership is the input to every placement decision. Brokers can disagree on it for up to one poll interval, or less after a Rejoin. Lookups, write fallbacks and handoff (§7) are designed to absorb that.
+Membership is the input to every placement decision. Brokers can disagree on it for about one signal poll (5s) after a join, leave or change, or up to one backstop poll interval after a crash. Lookups, write fallbacks and handoff (§7) are designed to absorb that.
 
 ---
 
@@ -570,7 +574,7 @@ These were chosen without the owner; each is easy to change.
 6. **Presence states** (present / recently absent / gone / unknown) and the 10-minute tombstone retention.
 7. **Single-use ID rejection sampling**, so the issuer is the nearest Broker. The alternative, encoding the issuer in the ID, would break D12.
 8. **Time:** S3 `Date` as the reference clock, `max_skew` = 3s, and relative TTLs on the wire.
-9. **S3 timings:** heartbeat 15s, poll 30s, member TTL 60s, fence at 45s without a heartbeat, fast-join GET with negative cache, Rejoin on start.
+9. **S3 timings:** heartbeat 15s, membership signal checked every 5s, backstop poll 30s, member TTL 60s, fence at 45s without a heartbeat, fast-join GET with negative cache, Rejoin on start.
 10. **Tunables:** `replicas=3`, `virtual_ids=16`, `lookup_fanout=4`, `lookup_wait=1s`, `handoff_window=10s`, `rpc_timeout=2s`, `cap_ttl=60s`, `touch_threshold=10s`, `grace=15s`, `presence_reconcile=5m`, `presence_tombstone_ttl=10m`, location cache TTL 30s, max 2 re-routes per message.
 11. **Limits:** 64 sessions and 20 handshakes/s (burst 200) per IP; 10k live created caps per session; a 20k records/s mint admission rate per Broker; 100 held messages per target.
 

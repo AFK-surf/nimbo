@@ -140,6 +140,13 @@ type Node struct {
 	lastHB        time.Time // S3 time of the last successful heartbeat
 	hbInFlight    bool
 	pollInFlight  bool
+	pollAgain     bool // a refresh was requested while a poll was in flight
+	hbAgain       bool // the member object changed while a heartbeat was in flight
+	lastPut       []byte
+	signalGetting bool
+	signalETag    string // last ETag of the membership signal seen
+	signalWant    bool   // a signal write is due
+	signalPutting bool
 	ready         bool
 	fenced        bool
 	draining      bool
@@ -271,6 +278,7 @@ func (n *Node) Start() {
 	n.every(n.tun.SweepInterval, n.sweep)
 	n.every(n.tun.MemberHeartbeat, n.heartbeat)
 	n.every(n.tun.MemberPoll, n.poll)
+	n.every(n.tun.MemberSignalPoll, n.pollSignal)
 	n.every(n.tun.PresenceReconcile, n.reconcilePresence)
 	n.heartbeat()
 }

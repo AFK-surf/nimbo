@@ -25,14 +25,15 @@ type Tunables struct {
 	MaxReroutes          int
 	HoldBackstop         time.Duration
 
-	MemberHeartbeat time.Duration
-	MemberPoll      time.Duration
-	MemberTTL       time.Duration
-	FenceMargin     time.Duration
-	MaxSkew         time.Duration
-	FastJoinNegTTL  time.Duration
-	FastJoinPerSec  float64
-	RejoinRetry     time.Duration
+	MemberHeartbeat  time.Duration
+	MemberPoll       time.Duration // full refresh backstop: finds crashed Brokers
+	MemberSignalPoll time.Duration // membership signal check
+	MemberTTL        time.Duration
+	FenceMargin      time.Duration
+	MaxSkew          time.Duration
+	FastJoinNegTTL   time.Duration
+	FastJoinPerSec   float64
+	RejoinRetry      time.Duration
 
 	SuspectBase time.Duration
 	SuspectMax  time.Duration
@@ -70,14 +71,15 @@ func DefaultTunables() Tunables {
 		MaxReroutes:          2,
 		HoldBackstop:         2 * time.Second,
 
-		MemberHeartbeat: 15 * time.Second,
-		MemberPoll:      30 * time.Second,
-		MemberTTL:       60 * time.Second,
-		FenceMargin:     15 * time.Second,
-		MaxSkew:         3 * time.Second,
-		FastJoinNegTTL:  60 * time.Second,
-		FastJoinPerSec:  10,
-		RejoinRetry:     time.Second,
+		MemberHeartbeat:  15 * time.Second,
+		MemberPoll:       30 * time.Second,
+		MemberSignalPoll: 5 * time.Second,
+		MemberTTL:        60 * time.Second,
+		FenceMargin:      15 * time.Second,
+		MaxSkew:          3 * time.Second,
+		FastJoinNegTTL:   60 * time.Second,
+		FastJoinPerSec:   10,
+		RejoinRetry:      time.Second,
 
 		SuspectBase: 10 * time.Second,
 		SuspectMax:  2 * time.Minute,

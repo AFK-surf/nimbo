@@ -43,6 +43,9 @@ type bench struct {
 	holdS3   map[*Node]bool // hold back every S3 response to these nodes
 	started  int
 	heldList []func()
+	mute     map[ids.BrokerID]bool // frames from these Brokers are not sent
+	tune     func(*Tunables)       // applied to Brokers added from now on
+	lists    map[*Node]int         // S3 LISTs per Broker
 }
 
 type benchObj struct {
@@ -106,6 +109,10 @@ func (e *benchEnv) SendPeer(to ids.BrokerID, m *peerproto.Envelope) {
 	e.b.frames++
 	e.b.bytes += uint64(len(data))
 	from := e.n.id
+	if e.b.mute[from] {
+		e.b.q = append(e.b.q, func() { e.n.OnPeerSendFailed(to, m) })
+		return
+	}
 	e.b.q = append(e.b.q, func() {
 		d, err := peerproto.Unmarshal(data)
 		if err != nil {
@@ -135,6 +142,9 @@ func (e *benchEnv) S3(req S3Request, done func(S3Response)) {
 		resp.NotFound = !ok
 		resp.Body, resp.LastModified, resp.ETag = o.body, o.lm, fmt.Sprint(len(o.body), string(o.body))
 	case S3List:
+		if b.lists != nil {
+			b.lists[e.n]++
+		}
 		var keys []string
 		for k := range b.s3 {
 			if strings.HasPrefix(k, req.Key) {
@@ -223,13 +233,21 @@ func (b *bench) addNode(i int) *Node {
 		lim.MintAdmission, lim.MaxLiveCaps = 1e12, 1<<30
 		lim.CapsUsedPer10s, lim.UnknownPer10s, lim.BlobBytesPer10s = 1<<30, 1<<30, 1<<30
 		lim.SessionsPerIP, lim.HandshakesPerSec, lim.HandshakeBurst = 1<<30, 1e12, 1e12
-		n := New(Config{NodePub: pub, PublicNames: []string{"b.bench"}, Tunables: DefaultTunables(), Limits: lim}, env)
+		n := New(Config{NodePub: pub, PublicNames: []string{"b.bench"}, Tunables: b.tunables(), Limits: lim}, env)
 		env.n = n
 		b.nodes = append(b.nodes, n)
 		b.byID[n.id] = n
 		b.eps[n] = map[SessionID]*benchEP{}
 		return n
 	}
+}
+
+func (b *bench) tunables() Tunables {
+	t := DefaultTunables()
+	if b.tune != nil {
+		b.tune(&t)
+	}
+	return t
 }
 
 // benchEP is a minimal endpoint client.

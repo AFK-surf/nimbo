@@ -1,6 +1,7 @@
 package node
 
 import (
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"slices"
@@ -137,12 +138,18 @@ func (n *Node) observeDate(start time.Time, date time.Time) {
 func (n *Node) S3Offset() time.Duration { return n.s3Offset }
 
 func (n *Node) heartbeat() {
-	if n.hbInFlight || n.left || n.leaving || n.stopped {
+	if n.left || n.leaving || n.stopped {
 		return
 	}
-	n.hbInFlight = true
+	if n.hbInFlight {
+		// Its body may predate a change: write again when it completes.
+		n.hbAgain = true
+		return
+	}
+	n.hbInFlight, n.hbAgain = true, false
 	start := n.env.Wall()
-	n.env.S3(S3Request{Op: S3Put, Key: memberKey(n.id), Body: n.memberJSON()}, func(r S3Response) {
+	body := n.memberJSON()
+	n.env.S3(S3Request{Op: S3Put, Key: memberKey(n.id), Body: body}, func(r S3Response) {
 		n.hbInFlight = false
 		if n.stopped || n.left || n.leaving {
 			return
@@ -151,6 +158,14 @@ func (n *Node) heartbeat() {
 		if r.Err != nil {
 			n.after(2*time.Second, n.heartbeat)
 			return
+		}
+		if !bytes.Equal(body, n.lastPut) {
+			// Joined, restarted or changed its info: tell the others.
+			n.lastPut = body
+			n.signal()
+		}
+		if n.hbAgain {
+			n.after(0, n.heartbeat)
 		}
 		t := r.Date
 		if t.IsZero() {
@@ -166,11 +181,76 @@ func (n *Node) heartbeat() {
 	})
 }
 
+// signalKey is the membership signal: a Broker rewrites it (with a random
+// token, so that its ETag changes) after its member object changed, and
+// every Broker re-reads membership when the ETag changes. Heartbeats that
+// only refresh LastModified do not signal; a crashed Broker cannot, so the
+// periodic poll still runs as a backstop.
+const signalKey = "members.signal"
+
+// signal rewrites the membership signal; writes requested while one is in
+// flight coalesce into one more.
+func (n *Node) signal() {
+	n.signalWant = true
+	if n.signalPutting || n.stopped {
+		return
+	}
+	n.signalWant, n.signalPutting = false, true
+	var tok [16]byte
+	ids.RandBytes(n.env.Rand(), tok[:])
+	n.env.S3(S3Request{Op: S3Put, Key: signalKey, Body: []byte(hex.EncodeToString(tok[:]))}, func(r S3Response) {
+		n.signalPutting = false
+		if n.stopped {
+			return
+		}
+		if r.Err != nil {
+			n.signalWant = true
+			n.after(2*time.Second, n.signal)
+			return
+		}
+		if n.signalWant {
+			n.signal()
+		}
+	})
+}
+
+// pollSignal checks the membership signal and refreshes membership when it
+// changed. The ETag of this Broker's own writes is not recorded as seen: a
+// change another Broker signalled just before would otherwise be missed.
+func (n *Node) pollSignal() {
+	if n.signalGetting || !n.ready || n.left || n.stopped {
+		return
+	}
+	n.signalGetting = true
+	start := n.env.Wall()
+	n.env.S3(S3Request{Op: S3Get, Key: signalKey}, func(r S3Response) {
+		n.signalGetting = false
+		if n.stopped || r.Err != nil {
+			return
+		}
+		n.observeDate(start, r.Date)
+		if r.ETag != n.signalETag {
+			n.signalETag = r.ETag
+			n.refresh()
+		}
+	})
+}
+
+// refresh runs a full membership poll now, or right after the one in
+// flight (whose LIST may predate the change).
+func (n *Node) refresh() {
+	if n.pollInFlight {
+		n.pollAgain = true
+		return
+	}
+	n.poll()
+}
+
 func (n *Node) poll() {
 	if n.pollInFlight || n.left || n.stopped || n.lastHB.IsZero() {
 		return
 	}
-	n.pollInFlight = true
+	n.pollInFlight, n.pollAgain = true, false
 	start := n.env.Wall()
 	listStart := n.learn()
 	n.env.S3(S3Request{Op: S3List, Key: "members/"}, func(r S3Response) {
@@ -181,7 +261,7 @@ func (n *Node) poll() {
 		if r.Err != nil {
 			// Freeze: keep the last view and expire nobody.
 			n.pollInFlight = false
-			if !n.ready {
+			if !n.ready || n.pollAgain {
 				n.after(2*time.Second, n.poll)
 			}
 			return
@@ -215,6 +295,9 @@ func (n *Node) poll() {
 		}
 		finish := func() {
 			n.pollInFlight = false
+			if n.pollAgain {
+				n.after(0, n.poll)
+			}
 			// The LIST is a snapshot from listStart. What this Broker
 			// learned since (a Rejoin, a fast join, a frame carrying a new
 			// incarnation) is newer and wins; otherwise applying the
@@ -493,9 +576,16 @@ func (n *Node) sweepDrain() {
 		if n.stopped {
 			return
 		}
-		n.left = true
-		n.logf("left the cluster")
-		n.env.Left()
+		var tok [16]byte
+		ids.RandBytes(n.env.Rand(), tok[:])
+		n.env.S3(S3Request{Op: S3Put, Key: signalKey, Body: []byte(hex.EncodeToString(tok[:]))}, func(S3Response) {
+			if n.stopped {
+				return
+			}
+			n.left = true
+			n.logf("left the cluster")
+			n.env.Left()
+		})
 	})
 }
 

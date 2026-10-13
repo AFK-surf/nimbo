@@ -2,6 +2,7 @@ package node
 
 import (
 	"fmt"
+	"github.com/afk-surf/nimbo/internal/ids"
 	"testing"
 	"time"
 )
@@ -81,5 +82,49 @@ func TestPollDoesNotRollBackIncarnation(t *testing.T) {
 	}
 	if _, gone := a.departed[regKey(c2.id, c2.inc)]; gone {
 		t.Fatal("the new incarnation was marked departed")
+	}
+}
+
+// A joiner whose frames cannot reach the existing Brokers (over the
+// Tailscale mesh, magicsock drops packets from unknown keys) must still be
+// admitted within about one signal poll, not one full poll: it rewrites
+// the membership signal after writing its member object.
+func TestJoinerSeenThroughSignal(t *testing.T) {
+	b := newBench(t, 3)
+	for _, n := range b.nodes {
+		n.tun.MemberPoll = time.Hour // only the signal can trigger a refresh
+	}
+	b.mute = map[ids.BrokerID]bool{}
+	b.tune = func(tu *Tunables) { tu.MemberPoll = time.Hour }
+	d := b.addNode(3)
+	b.mute[d.id] = true // no Rejoin reaches the others
+	d.Start()
+	b.advance(d.tun.MemberSignalPoll + time.Second)
+	for _, n := range b.nodes[:3] {
+		if n.view.members[d.id] == nil {
+			t.Fatalf("%s did not admit the joiner within a signal poll", n.id.Abbrev())
+		}
+	}
+	// And a Broker that leaves is gone as fast.
+	b.mute[d.id] = false
+	d.Drain()
+	b.advance(d.tun.DrainTimeout + d.tun.MemberSignalPoll + 2*time.Second)
+	for _, n := range b.nodes[:3] {
+		if n.view.members[d.id] != nil {
+			t.Fatalf("%s still lists the Broker that left", n.id.Abbrev())
+		}
+	}
+}
+
+// Without changes, Brokers only read the signal: no LIST until the
+// backstop poll.
+func TestNoRefreshWithoutSignal(t *testing.T) {
+	b := newBench(t, 3)
+	b.lists = map[*Node]int{}
+	b.advance(25 * time.Second) // < MemberPoll since the last poll
+	for _, n := range b.nodes {
+		if got := b.lists[n]; got > 1 {
+			t.Errorf("%s listed members %d times without a change", n.id.Abbrev(), got)
+		}
 	}
 }
