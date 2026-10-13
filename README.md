@@ -64,7 +64,7 @@ const cap = await client.mint({ autoReply: true });
 const granted = await client.transfer(cap, otherEndpointKey, { durable: true });
 ```
 
-The TypeScript SDK does not open or accept streams yet; it sees a stream offer as an ordinary delivery, and an offer it ignores times out on the holder's side.
+Streams work the same way: `client.openStream(cap, payload)` on the holder, `d.acceptStream()` (or `d.rejectStream(reason)`) on an offer at the target.
 
 For SDK development, `go run ./cmd/nimbo-devcluster` starts a 3-Broker cluster on loopback with in-memory storage and prints its URLs.
 

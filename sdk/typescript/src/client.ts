@@ -2,6 +2,8 @@ import { decodeBase32, encodeBase32 } from "./base32.js";
 import { ClientClosedError, NimboError, SessionClosedError } from "./errors.js";
 import type { EndpointKey } from "./key.js";
 import { handshakeProof } from "./proof.js";
+import { Stream, StreamCloseCode, StreamError, streamURL } from "./stream.js";
+import type { AttachOptions, DataSocketConstructor } from "./stream.js";
 import type {
   AbortOptions,
   Bounce,
@@ -12,6 +14,7 @@ import type {
   JsonObject,
   Limits,
   MintOptions,
+  OpenStreamOptions,
   RenewItem,
   RequestOptions,
   SendOptions,
@@ -25,7 +28,11 @@ export const SUBPROTOCOL = "nimbo.v1";
 /** The part of the WHATWG WebSocket the client uses. */
 export interface WebSocketLike {
   readonly protocol: string;
-  send(data: string): void;
+  /** Set to "arraybuffer" on stream data sockets. */
+  binaryType?: string;
+  readonly bufferedAmount?: number;
+  /** Control sessions send strings; stream data sockets also send bytes. */
+  send(data: string | ArrayBuffer | ArrayBufferView): void;
   close(code?: number, reason?: string): void;
   addEventListener(type: "open", listener: () => void): void;
   addEventListener(type: "message", listener: (ev: { data: unknown }) => void): void;
@@ -126,6 +133,8 @@ export class Client {
   #replyWaiters = new Map<string, ReplyWaiter>();
   #kept = new Set<string>();
   #renewTimer: ReturnType<typeof setInterval> | undefined;
+  /** Streams this session opened, awaiting their stream_status. */
+  #streamWaiters = new Map<string, { resolve(): void; reject(err: unknown): void }>();
 
   constructor(options: ClientOptions) {
     let u: URL;
@@ -197,7 +206,14 @@ export class Client {
   /** Creates a cap that targets and is held by this endpoint. Returns its ID (also its lineage ID). */
   async mint(options: MintOptions = {}): Promise<string> {
     const r = await this.#request(
-      { op: "mint", schema: options.schema, base: options.base, auto_reply: options.autoReply || undefined, durable: options.durable || undefined },
+      {
+        op: "mint",
+        schema: options.schema,
+        base: options.base,
+        auto_reply: options.autoReply || undefined,
+        durable: options.durable || undefined,
+        allow_stream: options.allowStream || undefined,
+      },
       options.signal,
     );
     return r.cap as string;
@@ -214,10 +230,11 @@ export class Client {
    * the message was accepted for routing, not that it was delivered.
    */
   async send(cap: string, payload: JsonObject, options: SendOptions = {}): Promise<SendResult> {
-    return this.#send(cap, payload, options, undefined);
+    const r = await this.#send("send", cap, payload, options, undefined);
+    return { msg: r.msg as string, replyId: r.reply_id as string | undefined };
   }
 
-  async #send(cap: string, payload: JsonObject, options: SendOptions, onOk: Pending["onOk"]): Promise<SendResult> {
+  async #send(op: "send" | "stream", cap: string, payload: JsonObject, options: SendOptions, onOk: Pending["onOk"]): Promise<Frame> {
     if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
       throw new TypeError("nimbo: payload must be a JSON object");
     }
@@ -225,13 +242,72 @@ export class Client {
       schema: options.reply.schema,
       base: options.reply.base,
       auto_reply: options.reply.autoReply || undefined,
+      allow_stream: options.reply.allowStream || undefined,
     };
-    const r = await this.#request(
-      { op: "send", cap, payload, caps: options.caps?.length ? options.caps : undefined, ttl_ms: options.ttlMs, reply },
+    return this.#request(
+      { op, cap, payload, caps: options.caps?.length ? options.caps : undefined, ttl_ms: options.ttlMs, reply },
       options.signal,
       onOk,
     );
-    return { msg: r.msg as string, replyId: r.reply_id as string | undefined };
+  }
+
+  /**
+   * Opens a stream to the target of `cap` (which must have allow_stream):
+   * `payload` goes to the target as the offer, then this endpoint's data
+   * socket attaches to its Broker. Resolves once attached; messages sent
+   * before the target accepts wait in the socket's buffers, and
+   * `stream.accepted` reports the outcome.
+   */
+  async openStream(cap: string, payload: JsonObject = {}, options: OpenStreamOptions = {}): Promise<Stream> {
+    let status: Promise<void> | undefined;
+    const r = await this.#send("stream", cap, payload, options, (f) => {
+      // The status follows the result on the session, possibly in the same
+      // read: register for it while the result is handled.
+      const w = deferred<void>();
+      w.promise.catch(() => {});
+      this.#streamWaiters.set(String(f.stream), w);
+      status = w.promise;
+    });
+    const stream = new Stream({
+      id: String(r.stream),
+      replyId: typeof r.reply_id === "string" && r.reply_id !== "" ? r.reply_id : undefined,
+      url: streamURL(this.#opts.url),
+      token: String(r.token),
+      WebSocket: this.#WebSocket as DataSocketConstructor,
+      accepted: status,
+    });
+    if (!options.detached) await stream.attach({ signal: options.signal, timeoutMs: options.attachTimeoutMs });
+    return stream;
+  }
+
+  /**
+   * Accepts a stream offer (a delivery with `stream` set) by attaching this
+   * endpoint's data socket. Resolves once the stream is paired with the
+   * holder. Accept within 60s of the delivery.
+   */
+  async acceptStream(offer: Delivery, options: AttachOptions = {}): Promise<Stream> {
+    if (!offer.stream || !offer.streamToken) throw new TypeError("nimbo: the delivery is not a stream offer");
+    const stream = new Stream({
+      id: offer.stream,
+      replyId: undefined,
+      url: streamURL(this.#opts.url),
+      token: offer.streamToken,
+      WebSocket: this.#WebSocket as DataSocketConstructor,
+      accepted: undefined,
+    });
+    await stream.attach(options);
+    return stream;
+  }
+
+  /**
+   * Refuses a stream offer: attaches and closes at once with 4901, so the
+   * holder's data socket closes with that code and `reason`. Ignoring an
+   * offer also works; the holder then gets `peer_attach_timeout`.
+   */
+  async rejectStream(offer: Delivery, reason = "", options: AttachOptions = {}): Promise<void> {
+    const stream = await this.acceptStream(offer, options);
+    stream.close(StreamCloseCode.rejected, reason);
+    await stream.closed;
   }
 
   /**
@@ -247,7 +323,7 @@ export class Client {
     const waiter = deferred<Delivery>();
     waiter.promise.catch(() => {}); // handled below; close() may reject it first
     let replyId: string | undefined;
-    await this.#send(cap, payload, options, (f) => {
+    await this.#send("send", cap, payload, options, (f) => {
       // The reply can be dispatched right after the result, before this
       // function resumes (Node delivers frames from one read back to back),
       // so the waiter is registered while the result is handled.
@@ -315,6 +391,7 @@ export class Client {
       issuer: i.issuer,
       mintedAt: i.minted_at,
       autoReply: !!i.auto_reply,
+      allowStream: !!i.allow_stream,
       ttlMs: i.ttl_ms,
     };
     if (i.schema !== undefined) info.schema = i.schema;
@@ -366,6 +443,14 @@ export class Client {
       q.reject(err);
     }
     for (const w of [...this.#replyWaiters.values()]) w.reject(err);
+    this.#failStreamWaiters(err);
+  }
+
+  /** stream_status goes only to the session that opened the stream. */
+  #failStreamWaiters(err: Error): void {
+    const ws = [...this.#streamWaiters.values()];
+    this.#streamWaiters.clear();
+    for (const w of ws) w.reject(err);
   }
 
   /** `using client = new Client(...)` closes it at the end of the scope. */
@@ -578,23 +663,41 @@ export class Client {
       case "bounce":
         this.#emit("bounce", { msg: String(f.msg), reason: String(f.reason) });
         return;
+      case "stream_status": {
+        const id = String(f.stream);
+        const w = this.#streamWaiters.get(id);
+        if (!w) return;
+        this.#streamWaiters.delete(id);
+        if (f.state === "accepted") w.resolve();
+        else w.reject(new StreamError(String(f.reason ?? "unknown"), typeof f.detail === "string" && f.detail ? f.detail : undefined));
+        return;
+      }
     }
   }
 
   #delivery(f: Frame): Delivery {
     const reply = typeof f.reply === "string" && f.reply !== "" ? f.reply : undefined;
     const client = this;
-    return {
+    const d: Delivery = {
       msg: String(f.msg),
       on: String(f.on),
       payload: (f.payload ?? {}) as JsonObject,
       caps: Array.isArray(f.caps) ? (f.caps as string[]) : [],
       reply,
+      stream: typeof f.stream === "string" && f.stream !== "" ? f.stream : undefined,
+      streamToken: typeof f.stream_token === "string" && f.stream_token !== "" ? f.stream_token : undefined,
       respond(payload: JsonObject, options?: SendOptions): Promise<SendResult> {
         if (!reply) return Promise.reject(new NimboError("no_reply", "the delivery has no reply cap"));
         return client.send(reply, payload, options);
       },
+      acceptStream(options?: AttachOptions): Promise<Stream> {
+        return client.acceptStream(d, options);
+      },
+      rejectStream(reason?: string, options?: AttachOptions): Promise<void> {
+        return client.rejectStream(d, reason, options);
+      },
     };
+    return d;
   }
 
   /** Called once per connection when it ends, for whatever reason. */
@@ -606,6 +709,7 @@ export class Client {
     const err = new SessionClosedError();
     for (const p of conn.pending.values()) p.reject(err);
     conn.pending.clear();
+    if (conn.open) this.#failStreamWaiters(err);
     if (this.#state === "closed") return;
     this.#state = "connecting";
     const closing = conn.closing;
@@ -695,6 +799,7 @@ interface WireCapInfo {
   schema?: JsonObject;
   base?: JsonObject;
   auto_reply?: boolean;
+  allow_stream?: boolean;
   ttl_ms: number;
 }
 
@@ -709,6 +814,9 @@ function toLimits(l: Record<string, number>): Limits {
     maxLiveCaps: l.max_live_caps ?? 0,
     defaultTtlMs: l.default_ttl_ms ?? 0,
     maxTtlMs: l.max_ttl_ms ?? 0,
+    maxPendingStreams: l.max_pending_streams ?? 0,
+    streamAttachTtlMs: l.stream_attach_ttl_ms ?? 0,
+    streamSocketsPerIp: l.stream_sockets_per_ip ?? 0,
   };
 }
 

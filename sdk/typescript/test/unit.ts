@@ -3,6 +3,9 @@ import {
   ClientClosedError,
   NimboError,
   SessionClosedError,
+  StreamAttachError,
+  StreamCloseCode,
+  StreamError,
   decodeBase32,
   encodeBase32,
   exportKey,
@@ -10,7 +13,7 @@ import {
   handshakeProof,
   importKey,
 } from "../dist/index.js";
-import type { ClientOptions, Delivery, DisconnectEvent } from "../dist/index.js";
+import type { ClientOptions, Delivery, DisconnectEvent, StreamMessage } from "../dist/index.js";
 import { FakeBroker } from "./fakebroker.ts";
 import { Inbox, assert, eq, rejects, sleep, until } from "./harness.ts";
 import type { Test } from "./harness.ts";
@@ -269,7 +272,7 @@ export const unitTests: Test[] = [
         eq(await client.transfer("c", "k", { durable: true }), "c->k", "transfer");
         eq(
           await client.inspect("c"),
-          { lineage: "l", kind: "minted", singleUse: false, target: "t", holder: "h", issuer: "i", mintedAt: 5, autoReply: true, ttlMs: 6, base: { a: 1 } },
+          { lineage: "l", kind: "minted", singleUse: false, target: "t", holder: "h", issuer: "i", mintedAt: 5, autoReply: true, allowStream: false, ttlMs: 6, base: { a: 1 } },
           "inspect",
         );
         const [mint, send, transfer] = broker.requests.map(({ rid: _, ...f }) => f);
@@ -429,6 +432,156 @@ export const unitTests: Test[] = [
       await sleep(50);
       eq(broker.sockets.length, 1, "no reconnect");
       eq(ds.size, 0, "no disconnect event for close()");
+    },
+  },
+  {
+    name: "streams: openStream sends op stream, attaches with the token, and reports the status",
+    async fn() {
+      const { broker, client } = fake({ url: "wss://broker.test/base/v1/ws", authority: "broker.test:443" });
+      try {
+        let n = 0;
+        broker.handlers.stream = () => ({ stream: `st${++n}`, msg: `st${n}`, token: `tok${n}`, reply_id: "r" });
+        const s1 = await client.openStream("c", { proto: "x" }, { ttlMs: 500, reply: { allowStream: true } });
+        const { rid: _, ...frame } = broker.requests[0]!;
+        eq(frame, { op: "stream", cap: "c", payload: { proto: "x" }, ttl_ms: 500, reply: { allow_stream: true } }, "stream frame");
+        eq([s1.id, s1.replyId, s1.state, s1.token], ["st1", "r", "open", undefined], "stream");
+        const u = new URL(broker.dataSockets[0]!.url);
+        eq([u.host, u.pathname, u.searchParams.get("token")], ["broker.test", "/base/v1/stream", "tok1"], "data socket URL");
+        eq(broker.dataSockets[0]!.protocols, ["nimbo.stream.v1"], "subprotocol");
+        broker.last.push({ op: "stream_status", stream: "st1", state: "accepted" });
+        await s1.accepted;
+
+        // A failure, and a status sent in the same read as the result.
+        broker.handlers.stream = (f, s) => {
+          s.pushTogether(
+            { op: "result", rid: f.rid, ok: true, stream: "st2", msg: "st2", token: "tok2" },
+            { op: "stream_status", stream: "st2", state: "failed", reason: "ttl_expired", detail: "d" },
+          );
+          return undefined;
+        };
+        const s2 = await client.openStream("c");
+        const err = await rejects(s2.accepted);
+        assert(err instanceof StreamError && err.reason === "ttl_expired" && err.detail === "d", `got ${String(err)}`);
+
+        // Detached: no socket until attach().
+        broker.handlers.stream = () => ({ stream: "st3", msg: "st3", token: "tok3" });
+        const s3 = await client.openStream("c", {}, { detached: true });
+        eq([s3.state, s3.token, broker.dataSockets.length], ["detached", "tok3", 2], "detached stream");
+        await s3.attach();
+        eq([s3.state, new URL(broker.dataSockets[2]!.url).searchParams.get("token")], ["open", "tok3"], "attached later");
+
+        // The session drops before the status: it can no longer arrive.
+        broker.handlers.stream = () => ({ stream: "st4", msg: "st4", token: "tok4" });
+        const s4 = await client.openStream("c");
+        broker.last.drop();
+        assert((await rejects(s4.accepted)) instanceof SessionClosedError, "status lost with the session");
+        eq(s4.state, "open", "the data socket outlives the session");
+      } finally {
+        client.close();
+      }
+    },
+  },
+  {
+    name: "streams: text and binary messages in order, receive, iteration and close",
+    async fn() {
+      const { broker, client } = fake();
+      try {
+        broker.handlers.stream = () => ({ stream: "st", msg: "st", token: "tok" });
+        const st = await client.openStream("c");
+        const sock = broker.dataSockets[0]!;
+        eq(sock.binaryType, "arraybuffer", "binaryType");
+        st.send("hi");
+        st.send(new Uint8Array([1, 2, 3]).subarray(1));
+        eq(sock.sent, ["hi", new Uint8Array([2, 3])], "sent");
+        // A Blob converts asynchronously and must not overtake later messages.
+        sock.pushData(new Blob([new Uint8Array([9])]));
+        sock.pushData("text");
+        sock.pushData(new Uint8Array([4, 5]).buffer);
+        sock.pushData(new Uint8Array([7, 7, 6]).subarray(2));
+        eq(await st.receive(), new Uint8Array([9]), "blob");
+        eq(await st.receive(), "text", "text");
+        const got: StreamMessage[] = [];
+        sock.closeFromPeer(3001, "bye");
+        for await (const m of st) got.push(m);
+        eq(got, [new Uint8Array([4, 5]), new Uint8Array([6])], "the rest, then the end");
+        eq(await st.closed, { code: 3001, reason: "bye" }, "close");
+        eq([st.state, await st.receive()], ["closed", undefined], "closed");
+        let threw = false;
+        try {
+          st.send("late");
+        } catch {
+          threw = true;
+        }
+        assert(threw, "send after close throws");
+
+        // With a message listener, messages go to it.
+        const st2 = await client.openStream("c");
+        const msgs = new Inbox<StreamMessage>();
+        st2.on("message", msgs.push);
+        broker.dataSockets[1]!.pushData("one");
+        eq(await msgs.next(), "one", "listener");
+        st2.close(3002, "done");
+        eq([broker.dataSockets[1]!.closeCode, broker.dataSockets[1]!.closeReason], [3002, "done"], "close code sent");
+        eq(await st2.closed, { code: 3002, reason: "done" }, "closed after our close");
+      } finally {
+        client.close();
+      }
+    },
+  },
+  {
+    name: "streams: offers, acceptStream, rejectStream and refused attaches",
+    async fn() {
+      const { broker, client } = fake();
+      try {
+        const deliveries = new Inbox<Delivery>();
+        client.on("deliver", deliveries.push);
+        await opened(client);
+        broker.last.push({ op: "deliver", msg: "st", on: "lin", payload: { proto: "x" }, stream: "st", stream_token: "ttok" });
+        const d = await deliveries.next();
+        eq([d.stream, d.streamToken, d.payload], ["st", "ttok", { proto: "x" }], "offer");
+        const st = await d.acceptStream();
+        eq([st.id, new URL(broker.dataSockets[0]!.url).searchParams.get("token")], ["st", "ttok"], "accepted with the offer's token");
+        await st.accepted;
+
+        broker.last.push({ op: "deliver", msg: "st2", on: "lin", payload: {}, stream: "st2", stream_token: "ttok2" });
+        const d2 = await deliveries.next();
+        const rejected = d2.rejectStream("busy");
+        await until(() => broker.dataSockets.length === 2 && broker.dataSockets[1]!.closed, "reject closes");
+        broker.dataSockets[1]!.emit("close", { code: StreamCloseCode.rejected, reason: "busy" });
+        await rejected;
+        eq([broker.dataSockets[1]!.closeCode, broker.dataSockets[1]!.closeReason], [4901, "busy"], "refusal code");
+
+        broker.last.push({ op: "deliver", msg: "m", on: "lin", payload: {} });
+        const plain = await deliveries.next();
+        eq([plain.stream, plain.streamToken], [undefined, undefined], "a plain message is no offer");
+        assert((await rejects(plain.acceptStream())) instanceof TypeError, "accepting a plain message");
+
+        broker.dataMode = "refuse";
+        broker.last.push({ op: "deliver", msg: "st3", on: "lin", payload: {}, stream: "st3", stream_token: "used" });
+        const d3 = await deliveries.next();
+        const err = await rejects(d3.acceptStream());
+        assert(err instanceof StreamAttachError, `got ${String(err)}`);
+      } finally {
+        client.close();
+      }
+    },
+  },
+  {
+    name: "streams: allow_stream on mint, reply options, inspect and limits",
+    async fn() {
+      const { broker, client } = fake();
+      try {
+        broker.handlers.inspect = () => ({ info: { lineage: "l", kind: "minted", target: "t", holder: "h", issuer: "i", minted_at: 1, allow_stream: true, ttl_ms: 2 } });
+        await client.mint({ allowStream: true });
+        broker.handlers.send = () => ({ msg: "m" });
+        await client.send("c", {}, { reply: { allowStream: true } });
+        eq((await client.inspect("c")).allowStream, true, "inspect");
+        const [mint, send] = broker.requests.map(({ rid: _, ...f }) => f);
+        eq(mint, { op: "mint", allow_stream: true }, "mint frame");
+        eq(send, { op: "send", cap: "c", payload: {}, reply: { allow_stream: true } }, "send frame");
+      } finally {
+        client.close();
+      }
     },
   },
 ];

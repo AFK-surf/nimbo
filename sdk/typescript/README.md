@@ -37,9 +37,11 @@ const reply = await other.request(granted, { text: "hi" }, { timeoutMs: 5000 });
 |---|---|
 | `generateKey()`, `importKey(priv)`, `exportKey(key)` | Endpoint keys (X25519). `key.publicKey` is the base32 endpoint key others transfer caps to. `exportKey` gives the private key in base32 for `importKey`. |
 | `new Client(options)` | `url`, `key`, and optionally `authority` (the `host[:port]` in the handshake proof; default: the URL's), `maxMessageBytes`, `clientName`, `WebSocket`, `backoffBaseMs`, `backoffMaxMs`, `connectTimeoutMs`, `renewIntervalMs`. |
-| `mint({ schema?, base?, autoReply?, durable? })` | Returns a new cap ID that targets and is held by this endpoint. The ID is also the lineage ID that deliveries on the cap report as `on`. |
+| `mint({ schema?, base?, autoReply?, durable?, allowStream? })` | Returns a new cap ID that targets and is held by this endpoint. The ID is also the lineage ID that deliveries on the cap report as `on`. |
 | `transfer(cap, to, { durable? })` | Returns a new cap ID held by endpoint `to`. Use `durable` whenever the ID leaves the session. |
 | `send(cap, payload, { caps?, ttlMs?, reply? })` | Returns `{ msg, replyId }`. `replyId` is set when the cap has auto-reply. Resolving means the message was accepted for routing, not that it was delivered. |
+| `openStream(cap, payload?, { detached?, attachTimeoutMs?, ...send options })` | Opens a stream to the target of a cap with `allowStream` and attaches this endpoint's data socket. Returns a `Stream` (see [Streams](#streams)). |
+| `acceptStream(offer)`, `rejectStream(offer, reason?)` | Answer a stream offer (also `d.acceptStream()`, `d.rejectStream(reason)` on the `Delivery`). |
 | `request(cap, payload, { timeoutMs?, ...send options })` | Sends, then returns the reply `Delivery` (default timeout 30s). The reply is not also emitted as `deliver`. |
 | `renew(caps)` | Returns `RenewItem[]`. Batches of more than 256 caps are split. |
 | `inspect(cap)` | Returns `CapInfo`. Only the holder may inspect a cap. |
@@ -54,7 +56,37 @@ Every request method accepts `{ signal }`. Field names are camelCase versions of
 - **`NimboError`**: the Broker rejected the request. `code` is a protocol error code (`invalid_cap`, `schema_violation`, `unavailable`, …), and `detail` explains it. `retryable` is true for `unavailable` and `rate_limited`. `request` adds two codes: `no_reply` (the cap has no auto-reply) and `timeout`.
 - **`SessionClosedError`**: the session ended before the result arrived.
 - **`ClientClosedError`**: the client was closed.
+- **`StreamError`**: a stream failed before its target attached. `reason` is `ttl_expired`, `receiver_busy`, `target_gone`, `unavailable` (the offer bounced), `peer_attach_timeout` or `canceled`.
+- **`StreamAttachError`**: a Broker refused a data socket (an unknown, used or expired token, a token used on another Broker, the holder's side gone, the other Broker unreachable, or a rate limit). WebSocket APIs do not expose the HTTP status, so it is not more specific.
 - An aborted `signal` rejects with the signal's reason.
+
+## Streams
+
+A stream is a full-duplex WebSocket pipe between a cap's holder and its target ([protocol §10](../../docs/protocol.md#10-streams)). The target allows them on the caps it mints; each side's data socket goes to its own Broker, at the same URL as its session but on `/v1/stream`.
+
+```ts
+// Target: allow streams on a cap, and answer offers.
+const inbox = await target.mint({ allowStream: true, durable: true });
+target.on("deliver", async (d) => {
+  if (!d.stream) return;                       // a plain message
+  if (d.payload.proto !== "echo/1") return d.rejectStream("unknown protocol"); // or ignore it
+  const st = await d.acceptStream();
+  for await (const m of st) st.send(m);        // echo until the holder closes
+});
+
+// Holder:
+const st = await holder.openStream(granted, { proto: "echo/1" });
+st.send("hello");                              // may be sent before the target accepts
+await st.accepted;                             // the target attached (or StreamError)
+console.log(await st.receive());               // "hello"
+st.close(1000, "done");
+```
+
+- **Messages** keep their type and boundaries: a `string` is a text message, a `Uint8Array` (or `ArrayBuffer`) a binary one. Read them with `st.on("message", ...)` or with `await st.receive()` / `for await (const m of st)`; messages that arrive while there is no `message` listener wait for `receive()`. `st.bufferedAmount` paces large writes.
+- **Closing:** `st.close(code, reason)` with 1000 or 3000–4899 (4901 refuses, as `rejectStream` does). `st.closed` resolves with the code and reason the other side or a Broker sent (`StreamCloseCode` names Nimbo's: 4902–4905 for failures before pairing, 4911 `peerLost`, 1001 `draining`, 1006 when the connection dropped). `st.on("close", ...)` also reports it.
+- **Status:** `st.accepted` (holder only) resolves once the target attached. A refusal still resolves it, and then closes the socket with 4901. It rejects with `StreamError` if the offer bounced or nobody attached in time, and with `SessionClosedError` if the session that opened the stream ended first (the stream itself goes on).
+- **Lifetime:** once attached, a stream is independent of the cap, the `Client` and its sessions: `client.close()` does not close it. An offer must be accepted within 60s of its delivery.
+- **Detached:** `openStream(cap, payload, { detached: true })` does not attach; `st.token` holds the token and `await st.attach()` attaches later (within the offer's TTL plus 60s).
 
 ## Runtimes
 
@@ -78,7 +110,7 @@ export class Endpoint extends DurableObject<Env> {
 }
 ```
 
-The SDK uses only `WebSocket`, `crypto.subtle`, `crypto.getRandomValues` and timers. X25519 comes from [`@noble/curves`](https://github.com/paulmillr/noble-curves), its only dependency.
+The SDK uses only `WebSocket`, `crypto.subtle`, `crypto.getRandomValues` and timers. Data sockets set `binaryType = "arraybuffer"` and also accept `Blob` and Node `Buffer` messages, so `ws` and other implementations work too. X25519 comes from [`@noble/curves`](https://github.com/paulmillr/noble-curves), its only dependency.
 
 ## Development
 
