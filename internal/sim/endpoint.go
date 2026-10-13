@@ -33,6 +33,7 @@ type Endpoint struct {
 	counter int
 	maxMsg  int
 	fifo    map[fifoKey]int
+	streams []*epStream
 }
 
 type pendingReq struct {
@@ -50,12 +51,14 @@ type heldCap struct {
 	schema    bool
 	base      string
 	autoReply bool
-	obtained  time.Duration
-	lastUse   time.Duration
-	spent     bool // a single-use cap that was used successfully
-	fresh     bool // obtained in the settled quiet phase
-	minted    bool
-	contested bool // deliberately used twice at once
+	// allowStream: the cap's record has allow_stream.
+	allowStream bool
+	obtained    time.Duration
+	lastUse     time.Duration
+	spent       bool // a single-use cap that was used successfully
+	fresh       bool // obtained in the settled quiet phase
+	minted      bool
+	contested   bool // deliberately used twice at once
 }
 
 type fifoKey struct {
@@ -189,6 +192,8 @@ func (e *Endpoint) onFrame(c *Conn, data []byte) {
 		e.w.check.delivered(e, c, &out)
 	case "bounce":
 		e.w.check.bounced(e, &out)
+	case "stream_status":
+		e.w.check.streamStatus(e, &out)
 	case "closing":
 		if out.RetryAfterMs > 0 {
 			e.backoff = time.Duration(out.RetryAfterMs) * time.Millisecond
@@ -239,6 +244,9 @@ func sortU64(a []uint64) {
 // retire models key rotation: the endpoint disconnects for good.
 func (e *Endpoint) retire() {
 	e.retired = true
+	for _, es := range e.streams {
+		es.abort()
+	}
 	for _, c := range append([]*Conn(nil), e.conns...) {
 		c.close()
 		e.onClosed(c, 0)
@@ -341,13 +349,18 @@ func (e *Endpoint) act() {
 		e.doMint(c)
 	case r < 0.22:
 		e.doTransfer(c)
+	case r < 0.63:
+		e.doSend(c, nil, false)
 	case r < 0.70:
-		e.doSend(c, nil)
+		// Open a stream; now and then on a cap without allow_stream.
+		if h := e.pick(func(h *heldCap) bool { return !h.spent && (h.allowStream || e.w.chance(0.05)) }); h != nil {
+			e.doSend(c, h, true)
+		}
 	case r < 0.75:
 		// A burst on one cap and session: tests FIFO through the sequencer.
 		if h := e.pick(func(h *heldCap) bool { return !h.spent && !h.singleUse }); h != nil {
 			for i := 0; i < 3; i++ {
-				e.doSend(c, h)
+				e.doSend(c, h, false)
 			}
 		}
 	case r < 0.85:
@@ -362,8 +375,8 @@ func (e *Endpoint) act() {
 }
 
 func (e *Endpoint) doMint(c *Conn) {
-	in := &wire.In{Op: "mint", AutoReply: e.w.chance(0.4), Durable: e.w.chance(0.2)}
-	h := &heldCap{target: e, autoReply: in.AutoReply, minted: true}
+	in := &wire.In{Op: "mint", AutoReply: e.w.chance(0.4), Durable: e.w.chance(0.2), AllowStream: e.w.chance(0.4)}
+	h := &heldCap{target: e, autoReply: in.AutoReply, minted: true, allowStream: in.AllowStream}
 	if e.w.chance(0.3) {
 		in.Schema = json.RawMessage(testSchema)
 		h.schema = true
@@ -449,7 +462,7 @@ func (e *Endpoint) transfer(c *Conn, h *heldCap, to *Endpoint) {
 	})
 }
 
-func (e *Endpoint) doSend(c *Conn, h *heldCap) {
+func (e *Endpoint) doSend(c *Conn, h *heldCap, stream bool) {
 	if h == nil {
 		h = e.pick(func(h *heldCap) bool { return !h.spent })
 	}
@@ -460,7 +473,9 @@ func (e *Endpoint) doSend(c *Conn, h *heldCap) {
 	nonce := fmt.Sprintf("%s-%d", e.name, e.counter)
 	payload := map[string]any{"nonce": nonce, "seq": e.counter, "from": e.name}
 	violate := ""
-	if h.schema && e.w.chance(0.05) {
+	if stream && !h.allowStream {
+		violate = wire.ErrStreamNotAllowed
+	} else if h.schema && e.w.chance(0.05) {
 		payload["seq"] = "bad"
 		violate = wire.ErrSchemaViolation
 	} else if h.base != "" && e.w.chance(0.05) {
@@ -469,6 +484,9 @@ func (e *Endpoint) doSend(c *Conn, h *heldCap) {
 	}
 	pb, _ := json.Marshal(payload)
 	in := &wire.In{Op: "send", Cap: h.id.String(), Payload: pb, TTLms: int64(e.w.dur(2*time.Second, 20*time.Second) / time.Millisecond)}
+	if stream {
+		in.Op = "stream"
+	}
 	var carried []*heldCap
 	if e.w.chance(0.2) {
 		if ch := e.pick(func(x *heldCap) bool { return x != h && !x.spent }); ch != nil {
@@ -476,9 +494,13 @@ func (e *Endpoint) doSend(c *Conn, h *heldCap) {
 			in.Caps = []string{ch.id.String()}
 		}
 	}
-	rec := &sendRec{nonce: nonce, from: e, conn: c, cap: *h, ttl: time.Duration(in.TTLms) * time.Millisecond, violate: violate}
+	rec := &sendRec{nonce: nonce, from: e, conn: c, cap: *h, ttl: time.Duration(in.TTLms) * time.Millisecond, violate: violate, stream: stream}
+	if stream {
+		rec.sr = &streamRec{rec: rec, holder: e, target: h.target}
+	}
 	if h.autoReply {
 		rec.reply.auto = e.w.chance(0.3)
+		rec.reply.stream = e.w.chance(0.3)
 		if e.w.chance(0.2) {
 			rec.reply.schema = true
 		}
@@ -486,7 +508,7 @@ func (e *Endpoint) doSend(c *Conn, h *heldCap) {
 			e.counter++
 			rec.reply.base = fmt.Sprintf("%s-r%d", e.name, e.counter)
 		}
-		in.Reply = &wire.ReplyOpts{AutoReply: rec.reply.auto}
+		in.Reply = &wire.ReplyOpts{AutoReply: rec.reply.auto, AllowStream: rec.reply.stream}
 		if rec.reply.schema {
 			in.Reply.Schema = json.RawMessage(testSchema)
 		}
@@ -513,6 +535,9 @@ func (e *Endpoint) doSend(c *Conn, h *heldCap) {
 			e.w.check.useResult(e, ch, out, useSend, sentAt)
 		}
 		if out != nil && out.OK {
+			if stream && !e.retired {
+				e.openedStream(c, rec, out)
+			}
 			if h.singleUse {
 				h.spent = true
 				e.dropCap(h)
@@ -621,6 +646,9 @@ func (e *Endpoint) doAttack(c *Conn, random bool) {
 
 // onDeliver handles the workload side of a delivery: new caps and replies.
 func (e *Endpoint) onDeliver(c *Conn, out *wire.Out, rec *sendRec) {
+	if rec != nil && rec.stream && out.StreamToken != "" {
+		e.onOffer(c, out, rec)
+	}
 	for i, cs := range out.Caps {
 		id, err := ids.ParseCapID(cs)
 		if err != nil || rec == nil || i >= len(rec.carried) {
@@ -638,13 +666,13 @@ func (e *Endpoint) onDeliver(c *Conn, out *wire.Out, rec *sendRec) {
 		e.w.check.violate("bad reply id")
 		return
 	}
-	h := &heldCap{id: id, target: rec.from, replyOf: rec.nonce, singleUse: true, schema: rec.reply.schema, base: rec.reply.base, autoReply: rec.reply.auto}
+	h := &heldCap{id: id, target: rec.from, replyOf: rec.nonce, singleUse: true, schema: rec.reply.schema, base: rec.reply.base, autoReply: rec.reply.auto, allowStream: rec.reply.stream}
 	e.addCap(h)
 	switch r := e.w.rng.Float64(); {
 	case r < 0.55:
 		e.w.After(e.w.dur(time.Millisecond, 200*time.Millisecond), func() {
 			if cs := e.liveConns(); len(cs) > 0 && e.byID[id] == h && e.w.check.attempts[h] == 0 {
-				e.doSend(cs[0], h)
+				e.doSend(cs[0], h, h.allowStream && e.w.chance(0.3))
 			}
 		})
 	case r < 0.65:
@@ -655,8 +683,8 @@ func (e *Endpoint) onDeliver(c *Conn, out *wire.Out, rec *sendRec) {
 				return
 			}
 			h.contested = true
-			e.doSend(cs[0], h)
-			e.doSend(cs[len(cs)-1], h)
+			e.doSend(cs[0], h, false)
+			e.doSend(cs[len(cs)-1], h, false)
 		})
 	case r < 0.72:
 		if to := e.w.randomPeer(e); to != nil {

@@ -1,6 +1,8 @@
 export { Client, SUBPROTOCOL } from "./client.js";
 export type { ClientOptions, WebSocketConstructor, WebSocketLike } from "./client.js";
 export { ClientClosedError, NimboError, SessionClosedError } from "./errors.js";
+export { STREAM_SUBPROTOCOL, Stream, StreamAttachError, StreamCloseCode, StreamError, streamURL } from "./stream.js";
+export type { AttachOptions, DataSocketConstructor, DataSocketLike, StreamCloseEvent, StreamEvents, StreamMessage } from "./stream.js";
 export type { ErrorCode, ProtocolErrorCode } from "./errors.js";
 export { exportKey, generateKey, importKey } from "./key.js";
 export type { EndpointKey } from "./key.js";

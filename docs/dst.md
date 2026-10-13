@@ -31,7 +31,9 @@ The simulator runs one event queue ordered by (time, sequence number) and delive
   - send messages (with carried caps, reply options, bursts of three on one cap, deliberate schema violations and base conflicts);
   - reply on single-use reply caps, sometimes through two sessions at once, sometimes moving the reply cap to another endpoint;
   - renew and inspect caps;
+  - open streams (§9.7 of the design) on caps with `allow_stream`, and some without. Holders attach at once, a few seconds late, never, or twice with the same token. Targets accept, refuse (4901), ignore, or attach after their token expired. Both sides exchange numbered messages and the holder closes with a random code; some targets close early, and some streams are long-lived (a minute) so that they span faults. Some attaches deliberately use another Broker;
   - attack: use other endpoints' cap IDs and random IDs, and forge handshakes (a proof bound to another authority, or for a different nonce).
+- **Stream data plane**: data sockets and mesh data connections are pipes with 0.5–10ms per hop and FIFO order. A crash kills the Broker's legs (endpoints notice within 0.1–3s, the Brokers at the other end of its data connections within 50ms); partitions and link resets break the data connections that cross them.
 - **Faults** during the fault phase (defaults; `-fault-scale` multiplies their rate): crashes with restarts, partitions, link resets, S3 outages, clock steps, drains, endpoint disconnects and key rotations. Then a quiet phase heals everything (restarting crashed and departed Brokers) so that liveness can be checked.
 
 ## 3. Invariants
@@ -45,12 +47,20 @@ Checked continuously (safety):
 5. **Expiry.** No cap is accepted (send, transfer, renew or inspect) more than `cap_ttl + grace` (75s, plus 5s of observation slack) after its last use.
 6. **TTL.** No message is delivered after its TTL.
 7. **Fencing.** A Broker that cannot reach S3, or whose clock is more than `max_skew` off, fences itself within 45–55s.
+8. **Streams.**
+   - A stream opens only on a cap with `allow_stream`, and `stream_not_allowed` is returned only without it; `inspect` reports the flag.
+   - Each token attaches at most once, only on the Broker incarnation that issued it, and never after its half's deadline. Reused, misplaced and late attaches are always refused.
+   - Every message on a stream comes from its peer (the holder from the cap's target, and back) on the same stream, in sequence: no loss, duplicate or reorder before the close.
+   - A close code an endpoint sends reaches the other side unchanged, with its reason; any other close is a Broker's (49xx, 1001). A stream that carried data is never closed as `unavailable` (fencing keeps established streams).
+   - At most one `stream_status` per stream, only to its holder; a failed stream never carries data; an offer is delivered as such only for a `stream`.
+   - No half-stream outlives its deadline by more than 2s (checked on every Broker every 5s), and no peer frame of an unknown kind is ever sent.
 
 Checked once the system is stable (liveness and convergence):
 
-8. **Service.** In the second half of the quiet phase (or in a scripted stable window), every send on a live cap to a connected target succeeds and is delivered exactly once, in order per (session, cap).
-9. **Replication.** Every cap used in the last 15s is held by every member of its placement set; every settled session's register is on every member of its presence placement set.
-10. **Membership.** All live Brokers agree on the member list and none is fenced.
+9. **Service.** In the second half of the quiet phase (or in a scripted stable window), every send on a live cap to a connected target succeeds and is delivered exactly once, in order per (session, cap).
+10. **Replication.** Every cap used in the last 15s is held by every member of its placement set; every settled session's register is on every member of its presence placement set.
+11. **Membership.** All live Brokers agree on the member list and none is fenced.
+12. **Streams complete.** In the quiet phase, a stream opened on a live cap to a connected target whose two sides attach at once is accepted, every message arrives on both sides, and the target sees the holder's close.
 
 Scripted scenarios (`sim_test.go`) add targeted expectations: a crashed Broker's endpoints keep all their caps once reconnected elsewhere (`TestCrashKeepsCaps`); old caps work again after a partition heals (`TestPartitionHeals`) and after a Broker's S3 outage (`TestS3OutageFences`); rolling restarts faster than S3 failure detection keep every live record fully replicated (`TestRollingRestarts`); endpoints that vanish with their Broker become `target_gone` once the Broker is declared dead plus `cap_ttl` (`TestGoneAfterBrokerCrash`).
 
@@ -103,8 +113,14 @@ Each mutation below was injected into the Broker and the named tests rerun:
 | Holders never prune a dead owner's registers | `TestGoneAfterBrokerCrash` |
 | No self-fencing | `TestS3OutageFences` and random seeds |
 | No suspicion reset on restart | `TestRollingRestarts` |
+| Stream tokens reusable | random seeds: token attached twice |
+| No `allow_stream` check | random seeds: stream opened and paired on a cap without it |
+| No holder-half deadline | random seeds: half-stream past its deadline |
+| Fencing closes established streams | random seeds: established stream closed as unavailable |
+| The holder's Broker pairs any pending half | random seeds: messages of another stream |
+| A relay drops a message (simulator) | random seeds: sequence gaps |
 
-Not caught, because other mechanisms cover them (defence in depth): removing `missing` → re-store on touches, removing hinted copies, removing the 2s backstop presence lookup for held messages, and removing the ingress sequencer (the workload's bursts did not produce a cold lookup ahead of a warm one).
+Not caught, because other mechanisms cover them (defence in depth): removing `missing` → re-store on touches, removing hinted copies, removing the 2s backstop presence lookup for held messages, and removing the ingress sequencer (the workload's bursts did not produce a cold lookup ahead of a warm one), and letting a holder half pair twice (a stream has exactly one target token, used once).
 
 ## 8. Limits
 

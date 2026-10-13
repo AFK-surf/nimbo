@@ -44,6 +44,9 @@ type Record struct {
 	Base      *ids.Hash   `cbor:"9,keyasint,omitempty"`
 	AutoReply bool        `cbor:"10,keyasint,omitempty"`
 	Hints     []ids.Short `cbor:"11,keyasint,omitempty"`
+	// AllowStream lets holders open streams to the target (design §9.7).
+	// Only the target sets it; copies inherit it.
+	AllowStream bool `cbor:"12,keyasint,omitempty"`
 }
 
 var (

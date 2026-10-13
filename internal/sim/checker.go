@@ -35,8 +35,8 @@ type sendRec struct {
 	ttl     time.Duration
 	violate string
 	reply   struct {
-		auto, schema bool
-		base         string
+		auto, schema, stream bool
+		base                 string
 	}
 	fifoSeq    int
 	sentAt     time.Duration
@@ -51,6 +51,9 @@ type sendRec struct {
 	deliveries  int
 	deliveredAt time.Duration
 	deliveredOn string
+
+	stream bool       // a stream offer
+	sr     *streamRec // its stream
 }
 
 // Checker records the workload's observations and checks invariants.
@@ -63,6 +66,8 @@ type Checker struct {
 	fifoLast       map[fifoKey]int
 	attempts       map[*heldCap]int
 	bounces        map[string]string // msg ID -> reason
+	streams        map[string]*streamRec
+	tokenOK        map[string]int
 	violations     []string
 	stats          Stats
 }
@@ -76,6 +81,8 @@ func newChecker(w *World) *Checker {
 		fifoLast:       map[fifoKey]int{},
 		attempts:       map[*heldCap]int{},
 		bounces:        map[string]string{},
+		streams:        map[string]*streamRec{},
+		tokenOK:        map[string]int{},
 		stats:          Stats{Errors: map[string]int{}},
 	}
 }
@@ -149,6 +156,12 @@ func (c *Checker) sendResult(rec *sendRec, out *wire.Out) {
 		if rec.cap.autoReply != (out.ReplyID != "") {
 			c.violate("send %s: reply_id presence %v, cap auto_reply %v", rec.nonce, out.ReplyID != "", rec.cap.autoReply)
 		}
+		if rec.stream && !rec.cap.allowStream {
+			c.violate("stream %s opened on a cap without allow_stream", rec.nonce)
+		}
+		if !rec.stream && (out.Stream != "" || out.Token != "") {
+			c.violate("send %s returned a stream", rec.nonce)
+		}
 	default:
 		rec.status = stFailed
 		rec.code = out.Error.Code
@@ -164,6 +177,9 @@ func (c *Checker) sendResult(rec *sendRec, out *wire.Out) {
 		}
 		if rec.code == wire.ErrNotHolder || rec.code == wire.ErrBadRequest {
 			c.violate("send %s on own cap failed with %s (%s)", rec.nonce, rec.code, out.Error.Detail)
+		}
+		if rec.code == wire.ErrStreamNotAllowed && (!rec.stream || rec.cap.allowStream) {
+			c.violate("send %s (stream=%v, allow_stream=%v) failed with stream_not_allowed", rec.nonce, rec.stream, rec.cap.allowStream)
 		}
 	}
 	if rec.expected && (out == nil || !out.OK) {
@@ -222,6 +238,8 @@ func (c *Checker) inspected(e *Endpoint, h *heldCap, out *wire.Out, sentAt time.
 		c.violate("%s: inspect returned wrong holder", e.name)
 	} else if out.Info.Target != h.target.key.String() {
 		c.violate("%s: inspect returned wrong target", e.name)
+	} else if out.Info.AllowStream != h.allowStream {
+		c.violate("%s: inspect returned allow_stream=%v, want %v", e.name, out.Info.AllowStream, h.allowStream)
 	}
 }
 
@@ -289,6 +307,7 @@ func (c *Checker) delivered(e *Endpoint, conn *Conn, out *wire.Out) {
 	if rec.cap.target.retired {
 		c.violate("message %s delivered to a retired endpoint", nonce)
 	}
+	c.streamOffered(e, out, rec)
 	e.onDeliver(conn, out, rec)
 }
 
@@ -339,6 +358,7 @@ func (c *Checker) finalChecks() {
 			}
 		}
 	}
+	c.finalStreamChecks()
 	var ref *Broker
 	for _, b := range w.brokers {
 		if b.alive {

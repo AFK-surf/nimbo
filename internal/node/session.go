@@ -40,6 +40,8 @@ type session struct {
 	blobBytes   int
 	created     map[ids.CapID]bool
 	pendingSend int
+	// holder halves this session opened that have not paired or failed
+	pendingStreams int
 }
 
 func (n *Node) allowlisted(ip netip.Addr) bool {
@@ -136,7 +138,7 @@ func (n *Node) OnSessionFrame(id SessionID, data []byte) {
 	}
 	n.rollWindow(s)
 	switch in.Op {
-	case "send":
+	case "send", "stream":
 		n.actSend(s, &in)
 	case "mint":
 		n.actMint(s, &in)
@@ -208,6 +210,10 @@ func (n *Node) wireLimits() wire.Limits {
 		MaxLiveCaps:     n.lim.MaxLiveCaps,
 		DefaultTTLms:    ms(n.tun.DefaultMsgTTL),
 		MaxTTLms:        ms(n.tun.MaxMsgTTL),
+
+		MaxPendingStreams:  n.lim.MaxPendingStreams,
+		StreamAttachTTLms:  ms(n.tun.StreamAttachTTL),
+		StreamSocketsPerIP: n.lim.StreamSocketsPerIP,
 	}
 }
 
@@ -328,6 +334,11 @@ func (n *Node) sweepSessions() {
 	for ip, b := range n.ipBuckets {
 		if n.ipSessions[ip] == 0 && now.Sub(b.at) > time.Minute {
 			delete(n.ipBuckets, ip)
+		}
+	}
+	for ip, b := range n.attachFails {
+		if now.Sub(b.at) > time.Minute {
+			delete(n.attachFails, ip)
 		}
 	}
 }

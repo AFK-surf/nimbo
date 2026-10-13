@@ -44,6 +44,11 @@ type Tunables struct {
 	DrainTimeout   time.Duration
 	HandshakeTTL   time.Duration
 
+	// Streams (design §9.7): how long a stream token stays valid, and how
+	// long established streams may outlive the start of a drain.
+	StreamAttachTTL  time.Duration
+	StreamDrainGrace time.Duration
+
 	CacheEntries  int
 	SchemaCache   int
 	BatchOps      int
@@ -90,6 +95,9 @@ func DefaultTunables() Tunables {
 		DrainTimeout:   30 * time.Second,
 		HandshakeTTL:   10 * time.Second,
 
+		StreamAttachTTL:  60 * time.Second,
+		StreamDrainGrace: 30 * time.Second,
+
 		CacheEntries:  100000,
 		SchemaCache:   1024,
 		BatchOps:      512,
@@ -120,6 +128,13 @@ type Limits struct {
 	MaxPeerQueue      int     // replication ops queued per peer
 	HeldPerTarget     int
 	MaxPendingPerSess int // queued sends awaiting a result per session
+
+	// Streams (design §9.7).
+	MaxPendingStreams      int     // holder halves not yet paired, per session
+	UnattachedPerTarget    int     // target halves not yet attached, per endpoint
+	StreamSocketsPerIP     int     // data sockets per client IP
+	StreamAttachFailPerSec float64 // failed attaches per client IP
+	MaxStreamLegs          int     // data-plane connections per Broker
 }
 
 // DefaultLimits returns the defaults of design §6.4 and §14.
@@ -144,6 +159,12 @@ func DefaultLimits() Limits {
 		MaxPeerQueue:      100000,
 		HeldPerTarget:     100,
 		MaxPendingPerSess: 4096,
+
+		MaxPendingStreams:      64,
+		UnattachedPerTarget:    16,
+		StreamSocketsPerIP:     256,
+		StreamAttachFailPerSec: 10,
+		MaxStreamLegs:          100000,
 	}
 }
 

@@ -12,8 +12,12 @@ export type Frame = { op: string; [k: string]: unknown };
 export type Handler = (f: Frame, s: FakeSocket) => Record<string, unknown> | undefined;
 
 export class FakeBroker {
-  /** Every socket ever opened, in order. */
+  /** Every session socket ever opened, in order. */
   readonly sockets: FakeSocket[] = [];
+  /** Every stream data socket (/v1/stream) ever opened, in order. */
+  readonly dataSockets: FakeSocket[] = [];
+  /** How to answer data sockets: "ok" opens them, "refuse" fails the upgrade. */
+  dataMode: "ok" | "refuse" = "ok";
   /** Requests received after the handshake, in order. */
   readonly requests: Frame[] = [];
   readonly hellos: Frame[] = [];
@@ -42,6 +46,16 @@ export class FakeBroker {
   }
 
   accept(s: FakeSocket): void {
+    if (new URL(s.url).pathname.endsWith("/v1/stream")) {
+      this.dataSockets.push(s);
+      const mode = this.dataMode;
+      later(() => {
+        if (s.closed) return;
+        if (mode === "refuse") return s.drop(1006);
+        s.emit("open", undefined);
+      });
+      return;
+    }
     this.sockets.push(s);
     const mode = this.mode;
     later(() => {
@@ -95,6 +109,10 @@ export class FakeSocket implements WebSocketLike {
   closed = false;
   established = false;
   closeCode: number | undefined;
+  closeReason: string | undefined;
+  binaryType = "blob";
+  /** What the client sent on a data socket. */
+  readonly sent: (string | Uint8Array)[] = [];
   #l: Listeners = {};
 
   readonly broker: FakeBroker;
@@ -116,15 +134,35 @@ export class FakeSocket implements WebSocketLike {
     for (const l of this.#l[type] ?? []) l(ev);
   }
 
-  send(data: string): void {
+  send(data: string | ArrayBuffer | ArrayBufferView): void {
     if (this.closed) throw new Error("send on a closed socket");
-    void this.broker.receive(this, JSON.parse(data) as Frame);
+    if (this.broker.dataSockets.includes(this)) {
+      if (typeof data === "string") this.sent.push(data);
+      else if (data instanceof ArrayBuffer) this.sent.push(new Uint8Array(data.slice(0)));
+      else this.sent.push(new Uint8Array(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)));
+      return;
+    }
+    void this.broker.receive(this, JSON.parse(data as string) as Frame);
+  }
+
+  /** Broker → client message on a data socket (any `data` a WebSocket may deliver). */
+  pushData(data: unknown): void {
+    if (this.closed) return;
+    later(() => this.emit("message", { data }));
+  }
+
+  /** The other side closed a data socket cleanly with this code. */
+  closeFromPeer(code: number, reason = ""): void {
+    if (this.closed) return;
+    this.closed = true;
+    later(() => this.emit("close", { code, reason }));
   }
 
   close(code = 1000, reason = ""): void {
     if (this.closed) return;
     this.closed = true;
     this.closeCode = code;
+    this.closeReason = reason;
     later(() => this.emit("close", { code, reason }));
   }
 

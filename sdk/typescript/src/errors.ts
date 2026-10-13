@@ -10,7 +10,8 @@ export type ProtocolErrorCode =
   | "base_conflict"
   | "too_large"
   | "rate_limited"
-  | "unavailable";
+  | "unavailable"
+  | "stream_not_allowed";
 
 /**
  * Every `NimboError` code: the protocol's, plus `no_reply` (`request` on a cap

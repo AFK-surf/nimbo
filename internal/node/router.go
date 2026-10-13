@@ -53,6 +53,8 @@ type message struct {
 	ingressSession uint64
 	sender         ids.Key
 	senderHints    []ids.Short
+	stream         bool // a stream offer
+	replyStream    bool // the reply cap gets allow_stream
 }
 
 type holdQueue struct {
@@ -70,6 +72,10 @@ func (n *Node) actSend(s *session, in *wire.In) {
 	}
 	if s.pendingSend >= n.lim.MaxPendingPerSess {
 		n.fail(s, in.Rid, wire.ErrRateLimited, "pending sends")
+		return
+	}
+	if in.Op == "stream" && s.pendingStreams >= n.lim.MaxPendingStreams {
+		n.fail(s, in.Rid, wire.ErrRateLimited, "pending streams")
 		return
 	}
 	s.pendingSend++
@@ -156,6 +162,10 @@ func (n *Node) processSend(req *sendReq, done func()) {
 			failDone(e)
 			return
 		}
+		if in.Op == "stream" && !v.r.cap.AllowStream {
+			failDone(cerr(wire.ErrStreamNotAllowed, ""))
+			return
+		}
 		n.checkTarget(v.r.cap, func(st presence.State, owners []ids.BrokerID, e *capErr) {
 			if e != nil {
 				failDone(e)
@@ -238,6 +248,7 @@ func (n *Node) acceptSend(s *session, in *wire.In, v *validated, carried []*vali
 		ingressSession: uint64(s.id),
 		sender:         s.key,
 		senderHints:    []ids.Short{n.short},
+		stream:         in.Op == "stream",
 	}
 	if c.AutoReply {
 		var e *capErr
@@ -251,6 +262,7 @@ func (n *Node) acceptSend(s *session, in *wire.In, v *validated, carried []*vali
 			return
 		}
 		m.replyAuto = reply.AutoReply
+		m.replyStream = reply.AllowStream
 		var rid ids.Lineage
 		ids.RandBytes(n.env.Rand(), rid[:])
 		m.replyID = &rid
@@ -297,6 +309,13 @@ func (n *Node) acceptSend(s *session, in *wire.In, v *validated, carried []*vali
 		if m.replyID != nil {
 			res.ReplyID = m.replyID.String()
 		}
+		if m.stream {
+			// The stream ID is the offer's message ID. The holder half
+			// lives until the offer's TTL plus the attach window.
+			res.Stream = res.Msg
+			res.Token = n.openHolderHalf(s, m.id, m.deadline.Sub(n.now()))
+			n.stats.StreamsOpened++
+		}
 		n.ok(s, res)
 		n.route(m, done)
 	}
@@ -315,6 +334,9 @@ func (n *Node) bounce(m *message, reason string) {
 }
 
 func (n *Node) bounceLocal(sid SessionID, msg ids.MsgID, reason string) {
+	if n.onStreamBounce(msg, reason) {
+		return
+	}
 	if s := n.sessions[sid]; s != nil && s.established {
 		n.sendFrame(sid, wire.Bounce{Op: "bounce", Msg: msg.String(), Reason: reason})
 	}
@@ -429,6 +451,8 @@ func (n *Node) forwardEnv(m *message) *peerproto.Envelope {
 		IngressSession: m.ingressSession,
 		Sender:         m.sender,
 		SenderHints:    m.senderHints,
+		Stream:         m.stream,
+		ReplyStream:    m.replyStream,
 	}}
 }
 
@@ -509,6 +533,8 @@ func (n *Node) handleForward(from ids.BrokerID, f *peerproto.Forward) *peerproto
 		ingressSession: f.IngressSession,
 		sender:         f.Sender,
 		senderHints:    f.SenderHints,
+		stream:         f.Stream,
+		replyStream:    f.ReplyStream,
 	}
 	k := c.Target
 	if len(n.byKey[k]) > 0 {
@@ -547,6 +573,10 @@ func (n *Node) deliverLocal(m *message) {
 		n.bounce(m, wire.BounceTTLExpired)
 		return
 	}
+	if m.stream && n.unattached[s.key] >= n.lim.UnattachedPerTarget {
+		n.bounce(m, wire.BounceReceiverBusy)
+		return
+	}
 	now := n.env.Wall().UnixMilli()
 	d := wire.Deliver{Op: "deliver", Msg: m.id.String(), On: m.tcap.Lineage.String(), Payload: m.payload}
 	for _, ref := range m.carried {
@@ -576,6 +606,8 @@ func (n *Node) deliverLocal(m *message) {
 			Base:      m.replyBase,
 			AutoReply: m.replyAuto,
 			Hints:     m.senderHints,
+
+			AllowStream: m.replyStream,
 		}
 		var rid ids.CapID
 		var ce *capErr
@@ -587,7 +619,19 @@ func (n *Node) deliverLocal(m *message) {
 		n.stats.Replies++
 		d.Reply = rid.String()
 	}
+	var th *halfStream
+	if m.stream {
+		// The target half is created as the offer is written: its token
+		// goes only to a session authenticated as the target's key.
+		var tok string
+		th, tok = n.openTargetHalf(m.id, s.key, m.ingress)
+		d.Stream, d.StreamToken = m.id.String(), tok
+		n.stats.StreamOffers++
+	}
 	if !n.sendFrame(s.id, d) {
+		if th != nil {
+			n.dropHalf(th)
+		}
 		n.bounce(m, wire.BounceReceiverBusy)
 		return
 	}

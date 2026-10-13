@@ -31,6 +31,7 @@ type Broker struct {
 	nextSess node.SessionID
 	conns    map[node.SessionID]*Conn
 	started  time.Duration
+	legs     map[node.StreamLeg]*simLeg
 }
 
 func newBroker(w *World, i int) *Broker {
@@ -39,7 +40,7 @@ func newBroker(w *World, i int) *Broker {
 	for j := range pub {
 		pub[j] = byte(r.Uint32())
 	}
-	b := &Broker{w: w, idx: i, pub: pub, id: ids.BrokerIDFromPub(pub), name: fmt.Sprintf("b%d.sim", i), conns: map[node.SessionID]*Conn{}}
+	b := &Broker{w: w, idx: i, pub: pub, id: ids.BrokerIDFromPub(pub), name: fmt.Sprintf("b%d.sim", i), conns: map[node.SessionID]*Conn{}, legs: map[node.StreamLeg]*simLeg{}}
 	b.baseSkew = w.dur(-1500*time.Millisecond, 1500*time.Millisecond)
 	b.skew = b.baseSkew
 	return b
@@ -73,6 +74,7 @@ func (b *Broker) crash() {
 	}
 	b.w.logf("%s CRASH", b)
 	b.node.Stop()
+	b.killLegs()
 	b.alive = false
 	b.gen++
 	b.w.resetLinksOf(b)
@@ -170,6 +172,7 @@ func (e *brokerEnv) Left() {
 	}
 	b.left = true
 	b.node.Stop()
+	b.killLegs()
 	b.alive = false
 	b.gen++
 	b.w.resetLinksOf(b)
@@ -228,6 +231,7 @@ func (w *World) resetAllLinks() {
 			}
 		}
 	}
+	w.breakMesh(nil, nil)
 }
 
 func (w *World) latency() time.Duration {

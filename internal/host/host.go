@@ -59,6 +59,11 @@ type Host struct {
 	sessions map[node.SessionID]*Session
 	nextSess atomic.Uint64
 	members  atomic.Pointer[[]node.Member]
+
+	// stream data plane (stream.go)
+	legMu   sync.Mutex
+	legs    map[node.StreamLeg]*streamLeg
+	nextLeg atomic.Uint64
 }
 
 // New creates a Host; Start runs it.
@@ -73,6 +78,7 @@ func New(opts Options) *Host {
 		done:     make(chan struct{}),
 		links:    map[linkKey]*link{},
 		sessions: map[node.SessionID]*Session{},
+		legs:     map[node.StreamLeg]*streamLeg{},
 	}
 	h.node = node.New(opts.Node, (*env)(h))
 	return h
@@ -148,6 +154,15 @@ func (h *Host) Close() {
 			s.close()
 		}
 		h.sessMu.Unlock()
+		h.legMu.Lock()
+		legs := make([]*streamLeg, 0, len(h.legs))
+		for _, l := range h.legs {
+			legs = append(legs, l)
+		}
+		h.legMu.Unlock()
+		for _, l := range legs {
+			l.finish()
+		}
 	})
 }
 

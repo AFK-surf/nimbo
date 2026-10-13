@@ -1,7 +1,7 @@
 // End-to-end tests against a real cluster (cmd/nimbo-devcluster).
 
-import { Client, NimboError, encodeBase32, generateKey } from "../dist/index.js";
-import type { Bounce, Delivery, DisconnectEvent, EndpointKey } from "../dist/index.js";
+import { Client, NimboError, StreamAttachError, StreamCloseCode, StreamError, encodeBase32, generateKey } from "../dist/index.js";
+import type { Bounce, Delivery, DisconnectEvent, EndpointKey, Stream, StreamMessage } from "../dist/index.js";
 import { Inbox, assert, eq, rejects, until } from "./harness.ts";
 import type { Test } from "./harness.ts";
 
@@ -31,6 +31,30 @@ async function withEndpoints(urls: string[], f: (...eps: Ep[]) => Promise<void>)
     for (const e of eps) e.client.close();
   }
 }
+
+/**
+ * a grants b a cap to a (with allow_stream unless told otherwise). Durable
+ * writes are retried while a restarted Broker is still suspected.
+ */
+async function grantStream(a: Ep, b: Ep, allowStream = true): Promise<string> {
+  for (let i = 0; ; i++) {
+    try {
+      const cap = await a.client.mint({ durable: true, allowStream });
+      return await a.client.transfer(cap, b.key.publicKey, { durable: true });
+    } catch (err) {
+      if (!(err instanceof NimboError && err.code === "unavailable") || i >= 10) throw err;
+    }
+  }
+}
+
+/** The next offer delivered to e. */
+async function nextOffer(e: Ep): Promise<Delivery> {
+  const d = await e.deliveries.next();
+  assert(d.stream && d.streamToken, `not a stream offer: ${JSON.stringify(d.payload)}`);
+  return d;
+}
+
+const bytes = (...b: number[]) => new Uint8Array(b);
 
 export const e2eTests: Test[] = [
   {
@@ -135,6 +159,93 @@ export const e2eTests: Test[] = [
     },
   },
   {
+    name: "e2e: streams across Brokers carry text and binary both ways and pass the close through",
+    async fn({ urls }) {
+      await withEndpoints([urls[0]!, urls[1]!], async (a, b) => {
+        const granted = await grantStream(a, b);
+        // b (the holder) opens; a (the target) accepts.
+        const hs = await b.client.openStream(granted, { proto: "echo/1" });
+        hs.send("early"); // waits in the socket until a accepts
+        const offer = await nextOffer(a);
+        eq([offer.stream, offer.payload], [hs.id, { proto: "echo/1" }], "offer");
+        const ts = await offer.acceptStream();
+        await hs.accepted;
+        eq(await ts.receive(), "early", "early message");
+
+        for (let i = 0; i < 10; i++) {
+          const m: StreamMessage = i % 2 ? bytes(i, 255, 0) : `text ${i}`;
+          ts.send(m);
+          eq(await hs.receive(), m, `to the holder ${i}`);
+          hs.send(m);
+          eq(await ts.receive(), m, `to the target ${i}`);
+        }
+        // A message larger than a relay chunk (32 KiB) and than a payload (64 KiB).
+        const big = globalThis.crypto.getRandomValues(new Uint8Array(65536)).slice();
+        const large = new Uint8Array(1 << 20);
+        for (let o = 0; o < large.length; o += big.length) large.set(big, o);
+        hs.send(large);
+        const got = await ts.receive();
+        assert(got instanceof Uint8Array && got.length === large.length && got.every((x, i) => x === large[i]), "1 MiB message");
+
+        // The stream outlives the holder's session.
+        b.client.close();
+        ts.send("still here");
+        eq(await hs.receive(), "still here", "after the session closed");
+        ts.close(3001, "bye");
+        eq(await hs.closed, { code: 3001, reason: "bye" }, "close passed through");
+        eq(await hs.receive(), undefined, "no more messages");
+      });
+    },
+  },
+  {
+    name: "e2e: streams on one Broker, the holder attaching after the target",
+    async fn({ urls }) {
+      await withEndpoints([urls[2]!, urls[2]!], async (a, b) => {
+        const granted = await grantStream(a, b);
+        const hs = await b.client.openStream(granted, {}, { detached: true });
+        eq(hs.state, "detached", "detached");
+        const ts = await (await nextOffer(a)).acceptStream();
+        await hs.accepted;
+        ts.send(bytes(1, 2, 3));
+        await hs.attach();
+        eq(await hs.receive(), bytes(1, 2, 3), "written before the holder attached");
+        hs.close();
+        eq((await ts.closed).code, 1000, "normal close");
+      });
+    },
+  },
+  {
+    name: "e2e: stream refusals and failures",
+    async fn({ urls }) {
+      await withEndpoints([urls[0]!, urls[1]!, urls[2]!], async (a, b, c) => {
+        const plain = await grantStream(a, b, false);
+        const notAllowed = await rejects(b.client.openStream(plain));
+        assert(notAllowed instanceof NimboError && notAllowed.code === "stream_not_allowed", `got ${String(notAllowed)}`);
+
+        // The target refuses: the holder's socket closes with 4901 and the reason.
+        const granted = await grantStream(a, b);
+        const hs = await b.client.openStream(granted);
+        const offer = await nextOffer(a);
+        await offer.rejectStream("busy");
+        eq(await hs.closed, { code: StreamCloseCode.rejected, reason: "busy" }, "refusal");
+        // The token was used.
+        assert((await rejects(offer.acceptStream())) instanceof StreamAttachError, "token reuse is refused");
+        // A token is valid only on the Broker that issued it.
+        const other = await rejects(c.client.acceptStream(offer));
+        assert(other instanceof StreamAttachError, `token on another Broker: ${String(other)}`);
+
+        // An offer that cannot be delivered: the stream fails with the bounce reason.
+        const gone = await grantStream(c, b);
+        c.client.close();
+        await until(() => c.client.state === "closed", "c closed");
+        const failed = await b.client.openStream(gone, {}, { ttlMs: 300 });
+        const err = await rejects(failed.accepted);
+        assert(err instanceof StreamError && err.reason === "ttl_expired", `got ${String(err)}`);
+        eq((await failed.closed).code, StreamCloseCode.ttlExpired, "the holder's socket closes with 4902");
+      });
+    },
+  },
+  {
     name: "e2e: requests wait for a Broker that is down, and sessions come back after a restart",
     needs: "ctl",
     async fn({ urls, ctl }) {
@@ -166,6 +277,32 @@ export const e2eTests: Test[] = [
       } finally {
         a.client.close();
         b.client.close();
+      }
+    },
+  },
+  {
+    name: "e2e: a stream ends with peer_lost when the other side's Broker stops",
+    needs: "ctl",
+    async fn({ urls, ctl }) {
+      const a = endpoint(urls[0]!);
+      const b = endpoint(urls[2]!);
+      let hs: Stream | undefined;
+      let stopped = false;
+      try {
+        const granted = await grantStream(a, b);
+        hs = await b.client.openStream(granted);
+        const ts = await (await nextOffer(a)).acceptStream();
+        await hs.accepted;
+        hs.send("ping");
+        eq(await ts.receive(), "ping", "flowing");
+        await ctl!("stop 2"); // the holder's Broker
+        stopped = true;
+        eq((await ts.closed).code, StreamCloseCode.peerLost, "the target sees peer_lost");
+      } finally {
+        hs?.close();
+        a.client.close();
+        b.client.close();
+        if (stopped) await ctl!("start 2");
       }
     },
   },

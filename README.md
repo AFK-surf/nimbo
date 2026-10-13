@@ -3,7 +3,7 @@
 Nimbo is a distributed, capability-based messaging fabric connecting AI agents, isolated runtimes and external devices.
 
 - **Brokers** (`nimbod`) form a cluster with no leader and no consensus: membership is a prefix in S3, and Brokers talk over an embedded Tailscale data plane (WireGuard with a cluster pre-shared key, NAT traversal, external DERP relays: Tailscale's public ones by default, or each Broker's own choice) with no control plane.
-- **Endpoints** connect over WebSocket with an ephemeral X25519 key. Connecting grants nothing: all authority comes from **capabilities**, 128-bit IDs bound to one holder, which can be minted, transferred, carried in messages and replied to (single-use reply caps).
+- **Endpoints** connect over WebSocket with an ephemeral X25519 key. Connecting grants nothing: all authority comes from **capabilities**, 128-bit IDs bound to one holder, which can be minted, transferred, carried in messages and replied to (single-use reply caps). A cap minted with `allow_stream` also lets its holders open a full-duplex WebSocket **stream** to its target: each side attaches a data socket to its own Broker with a one-time token, and the Brokers relay over the mesh.
 - Control state (caps, presence, schemas) lives on the 3 Brokers nearest its key in XOR space, refreshed by its writers; nothing is replicated cluster-wide.
 
 Read [docs/design.md](docs/design.md) for the design, [docs/protocol.md](docs/protocol.md) for the endpoint protocol, and [docs/dst.md](docs/dst.md) for how it is tested.
@@ -45,6 +45,14 @@ capID, _ := c.Mint(ctx, client.MintOptions{AutoReply: true})
 granted, _ := c.Transfer(ctx, capID, otherEndpointKey, true) // hand `granted` to the other endpoint
 ```
 
+Streams: the target mints with `AllowStream: true`; the holder opens, the target accepts the offer it receives:
+
+```go
+st, _ := holder.OpenStream(ctx, granted, client.StreamOptions{Payload: map[string]any{"proto": "ssh"}})
+// target, in OnDeliver: if d.Stream != "" { go target.AcceptStream(ctx, d) } (or RejectStream, or ignore it)
+st.Write(ctx, websocket.MessageBinary, data) // st.Read, st.Reader/Writer, st.NetConn, st.Close(code, reason)
+```
+
 ## Using it from TypeScript
 
 [`sdk/typescript`](sdk/typescript) runs in Bun, Node ≥ 22 and Cloudflare Workers. The client connects and reconnects in the background:
@@ -55,6 +63,8 @@ client.on("deliver", (d) => { /* d.on, d.payload, d.respond(...) */ });
 const cap = await client.mint({ autoReply: true });
 const granted = await client.transfer(cap, otherEndpointKey, { durable: true });
 ```
+
+Streams work the same way: `client.openStream(cap, payload)` on the holder, `d.acceptStream()` (or `d.rejectStream(reason)`) on an offer at the target.
 
 For SDK development, `go run ./cmd/nimbo-devcluster` starts a 3-Broker cluster on loopback with in-memory storage and prints its URLs.
 

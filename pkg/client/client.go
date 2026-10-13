@@ -69,6 +69,10 @@ type Delivery struct {
 	Payload json.RawMessage
 	Caps    []string // new cap IDs, now held by this endpoint
 	Reply   string   // single-use reply cap, if the cap has auto_reply
+	// Stream and StreamToken are set on a stream offer: AcceptStream or
+	// RejectStream answers it, or ignoring it lets it expire.
+	Stream      string
+	StreamToken string
 }
 
 // Bounce reports an undeliverable message this endpoint sent.
@@ -106,6 +110,8 @@ type Client struct {
 	closed  bool
 	cancel  context.CancelFunc
 	welcome *wire.Out
+	// streams this session opened, awaiting their stream_status
+	streams map[string]chan wire.Out
 }
 
 // Dial connects and keeps the session up until Close.
@@ -113,7 +119,7 @@ func Dial(ctx context.Context, opts Options) (*Client, error) {
 	if opts.ClientName == "" {
 		opts.ClientName = "nimbo-go/1"
 	}
-	c := &Client{opts: opts, ready: make(chan struct{}), pending: map[uint64]chan *wire.Out{}}
+	c := &Client{opts: opts, ready: make(chan struct{}), pending: map[uint64]chan *wire.Out{}, streams: map[string]chan wire.Out{}}
 	rctx, cancel := context.WithCancel(context.Background())
 	c.cancel = cancel
 	first := make(chan error, 1)
@@ -278,6 +284,11 @@ func (c *Client) session(ctx context.Context, first chan error) (time.Duration, 
 			close(p)
 			delete(c.pending, rid)
 		}
+		// stream_status goes only to the session that opened the stream.
+		for id, ch := range c.streams {
+			close(ch)
+			delete(c.streams, id)
+		}
 		c.mu.Unlock()
 	}()
 	for {
@@ -290,13 +301,27 @@ func (c *Client) session(ctx context.Context, first chan error) (time.Duration, 
 			c.mu.Lock()
 			p := c.pending[o.Rid]
 			delete(c.pending, o.Rid)
+			if o.OK && o.Stream != "" {
+				// Before the result is handed over, so the status (which
+				// follows it on the session) always finds its channel.
+				c.streams[o.Stream] = make(chan wire.Out, 1)
+			}
 			c.mu.Unlock()
 			if p != nil {
 				p <- o
 			}
 		case "deliver":
 			if c.opts.OnDeliver != nil {
-				c.opts.OnDeliver(Delivery{Msg: o.Msg, On: o.On, Payload: o.Payload, Caps: o.Caps, Reply: o.Reply})
+				c.opts.OnDeliver(Delivery{Msg: o.Msg, On: o.On, Payload: o.Payload, Caps: o.Caps, Reply: o.Reply, Stream: o.Stream, StreamToken: o.StreamToken})
+			}
+		case "stream_status":
+			c.mu.Lock()
+			ch := c.streams[o.Stream]
+			delete(c.streams, o.Stream)
+			c.mu.Unlock()
+			if ch != nil {
+				ch <- *o
+				close(ch)
 			}
 		case "bounce":
 			if c.opts.OnBounce != nil {
@@ -362,11 +387,13 @@ type MintOptions struct {
 	Base      json.RawMessage // optional JSON object merged into payloads
 	AutoReply bool
 	Durable   bool
+	// AllowStream lets holders of the cap open streams to this endpoint.
+	AllowStream bool
 }
 
 // Mint creates a cap targeting and held by this endpoint.
 func (c *Client) Mint(ctx context.Context, o MintOptions) (string, error) {
-	r, err := c.request(ctx, &wire.In{Op: "mint", Schema: o.Schema, Base: o.Base, AutoReply: o.AutoReply, Durable: o.Durable})
+	r, err := c.request(ctx, &wire.In{Op: "mint", Schema: o.Schema, Base: o.Base, AutoReply: o.AutoReply, Durable: o.Durable, AllowStream: o.AllowStream})
 	if err != nil {
 		return "", err
 	}

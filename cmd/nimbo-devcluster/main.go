@@ -145,6 +145,7 @@ func (c *cluster) start(b *broker) error {
 	})
 	mux := http.NewServeMux()
 	mux.Handle("/v1/ws", b.h)
+	mux.Handle("/v1/stream", b.h)
 	b.srv = &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	go b.srv.Serve(ln)
 	b.h.Start()

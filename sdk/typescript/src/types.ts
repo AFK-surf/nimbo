@@ -1,3 +1,5 @@
+import type { AttachOptions, Stream } from "./stream.js";
+
 /** A JSON object: what payloads, schemas and bases are. */
 export type JsonObject = Record<string, unknown>;
 
@@ -12,6 +14,12 @@ export interface Limits {
   maxLiveCaps: number;
   defaultTtlMs: number;
   maxTtlMs: number;
+  /** Streams this session may have waiting for their target (0 from a Broker without streams). */
+  maxPendingStreams: number;
+  /** How long a stream token is valid. */
+  streamAttachTtlMs: number;
+  /** Data sockets per client IP. */
+  streamSocketsPerIp: number;
 }
 
 /** A message that arrived on one of this endpoint's caps. */
@@ -26,8 +34,16 @@ export interface Delivery<T extends JsonObject = JsonObject> {
   readonly caps: string[];
   /** Single-use reply cap, when the cap has auto_reply. */
   readonly reply: string | undefined;
+  /** Set when the message is a stream offer: accept it, reject it, or ignore it. */
+  readonly stream: string | undefined;
+  /** The data-socket token of a stream offer (valid 60s, on the Broker that delivered it). */
+  readonly streamToken: string | undefined;
   /** Sends `payload` on `reply`. Rejects with `NimboError("no_reply")` when there is none. */
   respond(payload: JsonObject, options?: SendOptions): Promise<SendResult>;
+  /** Accepts a stream offer: `client.acceptStream(this)`. */
+  acceptStream(options?: AttachOptions): Promise<Stream>;
+  /** Refuses a stream offer with 4901 and `reason`: `client.rejectStream(this, reason)`. */
+  rejectStream(reason?: string, options?: AttachOptions): Promise<void>;
 }
 
 /** A message this endpoint sent that could not be delivered (best effort). */
@@ -50,6 +66,8 @@ export interface MintOptions extends AbortOptions {
   autoReply?: boolean;
   /** Return only once two placement-set Brokers hold the cap; use when the ID leaves this session. */
   durable?: boolean;
+  /** Holders of the cap (and of its copies) may open streams to this endpoint. */
+  allowStream?: boolean;
 }
 
 export interface TransferOptions extends AbortOptions {
@@ -60,6 +78,8 @@ export interface ReplyOptions {
   schema?: JsonObject;
   base?: JsonObject;
   autoReply?: boolean;
+  /** The receiver may open streams back to this endpoint on the reply cap. */
+  allowStream?: boolean;
 }
 
 export interface SendOptions extends AbortOptions {
@@ -76,6 +96,16 @@ export interface SendResult {
   msg: string;
   /** Lineage ID replies will arrive on, when the target cap has auto_reply. */
   replyId: string | undefined;
+}
+
+export interface OpenStreamOptions extends SendOptions {
+  /**
+   * Do not attach the data socket: `stream.token` holds the token and
+   * `stream.attach()` attaches later (within the offer's TTL plus 60s).
+   */
+  detached?: boolean;
+  /** Give up attaching after this long (default 30s). */
+  attachTimeoutMs?: number;
 }
 
 export interface RequestOptions extends SendOptions {
@@ -103,6 +133,8 @@ export interface CapInfo {
   schema?: JsonObject;
   base?: JsonObject;
   autoReply: boolean;
+  /** Holders may open streams to the target. */
+  allowStream: boolean;
   ttlMs: number;
 }
 
