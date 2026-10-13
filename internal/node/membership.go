@@ -12,6 +12,7 @@ import (
 	"github.com/afk-surf/nimbo/internal/ids"
 	"github.com/afk-surf/nimbo/internal/peerproto"
 	"github.com/afk-surf/nimbo/internal/placement"
+	"github.com/afk-surf/nimbo/pkg/wire"
 )
 
 // Membership through S3 (design §4).
@@ -524,6 +525,8 @@ func (n *Node) checkFence() {
 		n.stats.Fenced++
 		n.logf("fenced (stale heartbeat=%v, skew=%v)", stale, skew)
 		n.closeAllSessions("fenced")
+		// Established streams survive fencing; pending ones end.
+		n.failPendingStreams()
 	case !f && n.fenced:
 		// Peers may have declared this Broker dead meanwhile and turned its
 		// registers into tombstones. Come back as a new incarnation, exactly
@@ -550,6 +553,7 @@ func (n *Node) Drain() {
 	n.logf("draining")
 	n.after(0, n.heartbeat)
 	n.closeAllSessions("draining")
+	n.failPendingStreams()
 	n.applyMembers(n.copyMembers())
 	n.announce()
 }
@@ -561,7 +565,14 @@ func (n *Node) sweepDrain() {
 	if !n.draining || n.leaving || n.left {
 		return
 	}
-	idle := len(n.rejoinPending) == 0
+	// Established streams get up to StreamDrainGrace, then close with
+	// 1001; their Brokers on the other side relay the close.
+	grace := n.now().Sub(n.drainStarted) >= n.tun.StreamDrainGrace
+	if grace && !n.streamDrain {
+		n.streamDrain = true
+		n.closeEstablishedStreams(wire.CloseDraining, wire.ReasonDraining)
+	}
+	idle := len(n.rejoinPending) == 0 && (len(n.legs) == 0 || n.streamDrain)
 	for _, id := range sortedBrokerKeys(n.peers) {
 		p := n.peers[id]
 		if len(p.q) > 0 || p.inflight > 0 {

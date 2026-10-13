@@ -421,6 +421,8 @@ func (n *Node) actMint(s *session, in *wire.In) {
 		Base:      bh,
 		AutoReply: in.AutoReply,
 		Hints:     []ids.Short{n.short},
+
+		AllowStream: in.AllowStream,
 	}
 	n.stats.Minted++
 	n.createCap(c, in.Durable, func(id ids.CapID, e *capErr) {
@@ -550,6 +552,8 @@ func (n *Node) actInspect(s *session, in *wire.In) {
 			MintedAt:  c.MintedAt,
 			AutoReply: c.AutoReply,
 			TTLms:     ms(n.remaining(v.r)),
+
+			AllowStream: c.AllowStream,
 		}
 		if v.schema != nil {
 			info.Schema = v.schema.data

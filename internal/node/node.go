@@ -98,6 +98,25 @@ type Env interface {
 	// Left is called once a graceful leave has completed.
 	Left()
 	Logf(format string, args ...any)
+
+	// Stream data plane (design §9.7). The runtime calls
+	// Node.OnStreamLegClosed once for every leg it reported or created,
+	// whatever happens to it.
+	//
+	// AnswerAttach answers a data-socket request: AttachOK upgrades it.
+	AnswerAttach(l StreamLeg, code AttachCode)
+	// DialStreamPeer opens a data connection for stream id to Broker to,
+	// and reports the status byte with Node.OnStreamDialed.
+	DialStreamPeer(to ids.BrokerID, id ids.MsgID) StreamLeg
+	// AnswerStreamPeer writes the status byte on an inbound data
+	// connection.
+	AnswerStreamPeer(l StreamLeg, st PeerStatus)
+	// SpliceStream joins two legs: messages and the close flow between
+	// them until one side closes or fails, then both legs close.
+	SpliceStream(a, b StreamLeg)
+	// CloseStreamLeg closes a leg with a WebSocket close code and reason;
+	// if the leg is spliced, its partner closes with the same code.
+	CloseStreamLeg(l StreamLeg, code int, reason string)
 }
 
 var (
@@ -186,6 +205,17 @@ type Node struct {
 	seqs map[seqKey]*sequencer
 	held map[ids.Key]*holdQueue
 
+	// streams (stream.go)
+	holders     map[ids.MsgID]*halfStream
+	targets     map[ids.MsgID]*halfStream
+	tokens      map[[32]byte]*halfStream
+	legs        map[StreamLeg]*halfStream
+	unattached  map[ids.Key]int
+	legIP       map[StreamLeg]netip.Addr
+	ipLegs      map[netip.Addr]int
+	attachFails map[netip.Addr]*bucket
+	streamDrain bool // established streams were closed at the end of the drain grace
+
 	stats Stats
 }
 
@@ -197,6 +227,8 @@ type Stats struct {
 	Fenced                                       uint64
 	ViewChanges                                  uint64
 	HintedWrites                                 uint64
+	StreamsOpened, StreamOffers, StreamAttaches  uint64
+	StreamsPaired, StreamsSpliced                uint64
 }
 
 // New creates a Node. Call Start to begin.
@@ -226,6 +258,14 @@ func New(cfg Config, env Env) *Node {
 		ipBuckets:     map[netip.Addr]*bucket{},
 		seqs:          map[seqKey]*sequencer{},
 		held:          map[ids.Key]*holdQueue{},
+		holders:       map[ids.MsgID]*halfStream{},
+		targets:       map[ids.MsgID]*halfStream{},
+		tokens:        map[[32]byte]*halfStream{},
+		legs:          map[StreamLeg]*halfStream{},
+		unattached:    map[ids.Key]int{},
+		legIP:         map[StreamLeg]netip.Addr{},
+		ipLegs:        map[netip.Addr]int{},
+		attachFails:   map[netip.Addr]*bucket{},
 	}
 	if n.tun.Replicas == 0 {
 		n.tun = DefaultTunables()
@@ -516,6 +556,9 @@ type Snapshot struct {
 	Ready        bool
 	S3Offset     time.Duration
 	Incarnation  uint64
+	// Half-streams not yet spliced, and data-plane legs.
+	PendingStreams int
+	StreamLegs     int
 }
 
 // Snapshot returns current counters and gauges.
@@ -540,5 +583,8 @@ func (n *Node) Snapshot() Snapshot {
 		Ready:        n.Ready(),
 		S3Offset:     n.s3Offset,
 		Incarnation:  n.inc,
+
+		PendingStreams: len(n.holders) + len(n.targets),
+		StreamLegs:     len(n.legs),
 	}
 }

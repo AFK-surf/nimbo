@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http/httptest"
 	"strings"
@@ -29,6 +30,13 @@ type broker struct {
 func startCluster(t *testing.T, n int) []*broker { return startClusterMesh(t, n, false) }
 
 func startClusterMesh(t *testing.T, n int, tailscale bool) []*broker {
+	t.Helper()
+	return startClusterOpts(t, n, tailscale, nil, nil)
+}
+
+// startClusterOpts starts a cluster; tweak adjusts each Broker's config and
+// logs, if set, also receives every Broker's log.
+func startClusterOpts(t *testing.T, n int, tailscale bool, tweak func(*node.Config), logs io.Writer) []*broker {
 	t.Helper()
 	store := s3store.NewMem()
 	psk := make([]byte, 32)
@@ -102,17 +110,25 @@ func startClusterMesh(t *testing.T, n int, tailscale bool) []*broker {
 		b.srv = httptest.NewUnstartedServer(nil)
 		authority := b.srv.Listener.Addr().String()
 		b.url = "ws://" + authority + "/v1/ws"
+		cfg := node.Config{
+			NodePub:     k.Public[:],
+			Member:      node.MemberInfo{WSURLs: []string{b.url}, Endpoints: endpoints, DiscoPub: info.disco},
+			PublicNames: []string{authority},
+			Tunables:    node.DefaultTunables(),
+			Limits:      node.DefaultLimits(),
+		}
+		if tweak != nil {
+			tweak(&cfg)
+		}
+		var lw io.Writer = testWriter{t}
+		if logs != nil {
+			lw = io.MultiWriter(lw, logs)
+		}
 		b.h = host.New(host.Options{
-			Node: node.Config{
-				NodePub:     k.Public[:],
-				Member:      node.MemberInfo{WSURLs: []string{b.url}, Endpoints: endpoints, DiscoPub: info.disco},
-				PublicNames: []string{authority},
-				Tunables:    node.DefaultTunables(),
-				Limits:      node.DefaultLimits(),
-			},
+			Node:   cfg,
 			Store:  store,
 			Mesh:   m,
-			Logger: slog.New(slog.NewTextHandler(testWriter{t}, nil)).With("broker", i),
+			Logger: slog.New(slog.NewTextHandler(lw, nil)).With("broker", i),
 		})
 		info.Lock()
 		info.h = b.h

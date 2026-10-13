@@ -183,11 +183,19 @@ func (h *Host) acceptPeers() {
 }
 
 func (h *Host) servePeer(c net.Conn, from ids.BrokerID) {
-	defer c.Close()
 	br := bufio.NewReaderSize(c, 64<<10)
 	var pre [4]byte
 	c.SetReadDeadline(time.Now().Add(10 * time.Second))
-	if _, err := io.ReadFull(br, pre[:]); err != nil || pre != peerproto.Preamble {
+	if _, err := io.ReadFull(br, pre[:]); err != nil {
+		c.Close()
+		return
+	}
+	if pre == peerproto.StreamPreamble {
+		h.serveStreamPeer(c, br, from)
+		return
+	}
+	defer c.Close()
+	if pre != peerproto.Preamble {
 		return
 	}
 	for {

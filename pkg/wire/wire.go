@@ -12,6 +12,9 @@ import (
 // Subprotocol is the WebSocket subprotocol name.
 const Subprotocol = "nimbo.v1"
 
+// StreamSubprotocol is the subprotocol of stream data sockets (/v1/stream).
+const StreamSubprotocol = "nimbo.stream.v1"
+
 // Error codes (design §6.3).
 const (
 	ErrBadRequest      = "bad_request"
@@ -25,6 +28,8 @@ const (
 	ErrTooLarge        = "too_large"
 	ErrRateLimited     = "rate_limited"
 	ErrUnavailable     = "unavailable"
+	// ErrStreamNotAllowed: stream on a cap without allow_stream.
+	ErrStreamNotAllowed = "stream_not_allowed"
 )
 
 // Bounce reasons.
@@ -35,6 +40,71 @@ const (
 	BounceTargetGone   = "target_gone"
 	BounceUnavailable  = "unavailable"
 )
+
+// Stream states and failure reasons (stream_status).
+const (
+	StreamAccepted = "accepted"
+	StreamFailed   = "failed"
+
+	// ReasonPeerAttachTimeout: the other side did not attach in time.
+	ReasonPeerAttachTimeout = "peer_attach_timeout"
+	// ReasonPeerLost: a data connection or the other Broker failed.
+	ReasonPeerLost = "peer_lost"
+	// ReasonCanceled: the holder closed its data socket before pairing.
+	ReasonCanceled = "canceled"
+	// ReasonStreamRejected is the reason a target refusing a stream uses.
+	ReasonStreamRejected = "stream_rejected"
+	ReasonDraining       = "draining"
+)
+
+// Close codes on stream data sockets. 1000 and 3000-4899 pass through from
+// endpoints; 4900-4999 are reserved for Nimbo (an endpoint may send 4901 to
+// refuse a stream).
+const (
+	CloseNormal            = 1000
+	CloseDraining          = 1001
+	CloseStreamRejected    = 4901
+	CloseTTLExpired        = 4902
+	CloseTargetGone        = 4903
+	CloseReceiverBusy      = 4904
+	ClosePeerAttachTimeout = 4905
+	ClosePeerLost          = 4911
+	CloseRateLimited       = 4929
+	CloseUnavailable       = 4950
+)
+
+// CloseCodeFor maps a stream failure reason to its close code.
+func CloseCodeFor(reason string) int {
+	switch reason {
+	case BounceTTLExpired:
+		return CloseTTLExpired
+	case BounceTargetGone:
+		return CloseTargetGone
+	case BounceReceiverBusy, BounceTooLarge:
+		return CloseReceiverBusy
+	case ReasonPeerAttachTimeout:
+		return ClosePeerAttachTimeout
+	case ReasonPeerLost:
+		return ClosePeerLost
+	case ErrRateLimited:
+		return CloseRateLimited
+	case ReasonDraining:
+		return CloseDraining
+	case ReasonStreamRejected:
+		return CloseStreamRejected
+	}
+	return CloseUnavailable
+}
+
+// EndpointCloseCode is the code a Broker relays for a close code an endpoint
+// sent on its data socket: 1000, 3000-4899 and 4901 pass through, anything
+// else becomes 1000.
+func EndpointCloseCode(code int) int {
+	if code == CloseNormal || code == CloseStreamRejected || (code >= 3000 && code < 4900) {
+		return code
+	}
+	return CloseNormal
+}
 
 // In is any endpoint → broker frame. Only the fields of its op are set.
 type In struct {
@@ -48,7 +118,7 @@ type In struct {
 	Client          string `json:"client,omitempty"`
 	MaxMessageBytes int    `json:"max_message_bytes,omitempty"`
 
-	// send, transfer, inspect
+	// send, stream, transfer, inspect
 	Cap     string          `json:"cap,omitempty"`
 	Payload json.RawMessage `json:"payload,omitempty"`
 	Caps    []string        `json:"caps,omitempty"` // send: carried; renew: caps to renew
@@ -60,6 +130,8 @@ type In struct {
 	Base      json.RawMessage `json:"base,omitempty"`
 	AutoReply bool            `json:"auto_reply,omitempty"`
 	Durable   bool            `json:"durable,omitempty"`
+	// AllowStream lets holders open streams to the minter.
+	AllowStream bool `json:"allow_stream,omitempty"`
 
 	// transfer
 	To string `json:"to,omitempty"`
@@ -67,9 +139,10 @@ type In struct {
 
 // ReplyOpts configure the single-use reply cap of a send.
 type ReplyOpts struct {
-	Schema    json.RawMessage `json:"schema,omitempty"`
-	Base      json.RawMessage `json:"base,omitempty"`
-	AutoReply bool            `json:"auto_reply,omitempty"`
+	Schema      json.RawMessage `json:"schema,omitempty"`
+	Base        json.RawMessage `json:"base,omitempty"`
+	AutoReply   bool            `json:"auto_reply,omitempty"`
+	AllowStream bool            `json:"allow_stream,omitempty"`
 }
 
 // Challenge is the first broker frame.
@@ -92,6 +165,10 @@ type Limits struct {
 	MaxLiveCaps     int   `json:"max_live_caps"`
 	DefaultTTLms    int64 `json:"default_ttl_ms"`
 	MaxTTLms        int64 `json:"max_ttl_ms"`
+	// Streams (design §9.7).
+	MaxPendingStreams  int   `json:"max_pending_streams"`
+	StreamAttachTTLms  int64 `json:"stream_attach_ttl_ms"`
+	StreamSocketsPerIP int   `json:"stream_sockets_per_ip"`
 }
 
 type Welcome struct {
@@ -116,17 +193,18 @@ type RenewItem struct {
 
 // CapInfo is the inspect answer.
 type CapInfo struct {
-	Lineage   string          `json:"lineage"`
-	Kind      string          `json:"kind"`
-	SingleUse bool            `json:"single_use,omitempty"`
-	Target    string          `json:"target"`
-	Holder    string          `json:"holder"`
-	Issuer    string          `json:"issuer"`
-	MintedAt  int64           `json:"minted_at"`
-	Schema    json.RawMessage `json:"schema,omitempty"`
-	Base      json.RawMessage `json:"base,omitempty"`
-	AutoReply bool            `json:"auto_reply,omitempty"`
-	TTLms     int64           `json:"ttl_ms"`
+	Lineage     string          `json:"lineage"`
+	Kind        string          `json:"kind"`
+	SingleUse   bool            `json:"single_use,omitempty"`
+	Target      string          `json:"target"`
+	Holder      string          `json:"holder"`
+	Issuer      string          `json:"issuer"`
+	MintedAt    int64           `json:"minted_at"`
+	Schema      json.RawMessage `json:"schema,omitempty"`
+	Base        json.RawMessage `json:"base,omitempty"`
+	AutoReply   bool            `json:"auto_reply,omitempty"`
+	AllowStream bool            `json:"allow_stream,omitempty"`
+	TTLms       int64           `json:"ttl_ms"`
 }
 
 // Result answers a request.
@@ -140,6 +218,9 @@ type Result struct {
 	Cap     string      `json:"cap,omitempty"`
 	Renewed []RenewItem `json:"renewed,omitempty"`
 	Info    *CapInfo    `json:"info,omitempty"`
+	// stream: the stream ID and the holder's data-socket token.
+	Stream string `json:"stream,omitempty"`
+	Token  string `json:"token,omitempty"`
 }
 
 type Deliver struct {
@@ -149,6 +230,19 @@ type Deliver struct {
 	Payload json.RawMessage `json:"payload"`
 	Caps    []string        `json:"caps,omitempty"`
 	Reply   string          `json:"reply,omitempty"`
+	// A stream offer carries the stream ID and the target's data-socket
+	// token.
+	Stream      string `json:"stream,omitempty"`
+	StreamToken string `json:"stream_token,omitempty"`
+}
+
+// StreamStatus reports the outcome of a stream to its holder, once.
+type StreamStatus struct {
+	Op     string `json:"op"` // "stream_status"
+	Stream string `json:"stream"`
+	State  string `json:"state"` // "accepted" or "failed"
+	Reason string `json:"reason,omitempty"`
+	Detail string `json:"detail,omitempty"`
 }
 
 type Bounce struct {
@@ -189,7 +283,13 @@ type Out struct {
 	Payload json.RawMessage `json:"payload,omitempty"`
 	Caps    []string        `json:"caps,omitempty"`
 	Reply   string          `json:"reply,omitempty"`
-	// bounce, closing
+	// stream result, deliver of a stream offer, stream_status
+	Stream      string `json:"stream,omitempty"`
+	Token       string `json:"token,omitempty"`
+	StreamToken string `json:"stream_token,omitempty"`
+	State       string `json:"state,omitempty"`
+	Detail      string `json:"detail,omitempty"`
+	// bounce, closing, stream_status
 	Reason       string `json:"reason,omitempty"`
 	RetryAfterMs int64  `json:"retry_after_ms,omitempty"`
 }

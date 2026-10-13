@@ -108,8 +108,13 @@ func (s *Session) writer() {
 	}
 }
 
-// ServeHTTP serves the endpoint WebSocket at /v1/ws.
+// ServeHTTP serves the endpoint WebSocket at /v1/ws and stream data
+// sockets at /v1/stream.
 func (h *Host) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/v1/stream" {
+		h.serveStream(w, r)
+		return
+	}
 	c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		Subprotocols:       []string{wire.Subprotocol},
 		InsecureSkipVerify: true, // endpoints are not browsers; caps, not origins, grant authority

@@ -167,9 +167,14 @@ func (e *benchEnv) S3(req S3Request, done func(S3Response)) {
 	b.q = append(b.q, deliver)
 }
 
-func (e *benchEnv) MembersChanged([]Member)         {}
-func (e *benchEnv) Left()                           {}
-func (e *benchEnv) Logf(format string, args ...any) {}
+func (e *benchEnv) MembersChanged([]Member)                             {}
+func (e *benchEnv) Left()                                               {}
+func (e *benchEnv) Logf(format string, args ...any)                     {}
+func (e *benchEnv) AnswerAttach(StreamLeg, AttachCode)                  {}
+func (e *benchEnv) DialStreamPeer(ids.BrokerID, ids.MsgID) StreamLeg    { return 0 }
+func (e *benchEnv) AnswerStreamPeer(StreamLeg, PeerStatus)              {}
+func (e *benchEnv) SpliceStream(a, b StreamLeg)                         {}
+func (e *benchEnv) CloseStreamLeg(l StreamLeg, code int, reason string) {}
 
 // drain runs queued events until none are left.
 func (b *bench) drain() {

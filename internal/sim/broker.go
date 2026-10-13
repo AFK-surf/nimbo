@@ -400,3 +400,9 @@ func (c *Conn) close() {
 		}
 	})
 }
+
+func (e *brokerEnv) AnswerAttach(node.StreamLeg, node.AttachCode)             {}
+func (e *brokerEnv) DialStreamPeer(ids.BrokerID, ids.MsgID) node.StreamLeg    { return 0 }
+func (e *brokerEnv) AnswerStreamPeer(node.StreamLeg, node.PeerStatus)         {}
+func (e *brokerEnv) SpliceStream(a, b node.StreamLeg)                         {}
+func (e *brokerEnv) CloseStreamLeg(l node.StreamLeg, code int, reason string) {}

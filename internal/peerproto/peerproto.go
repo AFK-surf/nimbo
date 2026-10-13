@@ -201,6 +201,10 @@ type Forward struct {
 	IngressSession uint64       `cbor:"13,keyasint"`
 	Sender         ids.Key      `cbor:"14,keyasint"`
 	SenderHints    []ids.Short  `cbor:"15,keyasint,omitempty"`
+	// Stream marks a stream offer (design §9.7); ReplyStream sets
+	// allow_stream on the receiver's reply cap.
+	Stream      bool `cbor:"16,keyasint,omitempty"`
+	ReplyStream bool `cbor:"17,keyasint,omitempty"`
 }
 
 // ForwardCode is the outcome of a Forward.

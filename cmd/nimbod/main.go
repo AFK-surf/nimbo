@@ -322,6 +322,7 @@ func cmdRun(args []string) error {
 
 	mux := http.NewServeMux()
 	mux.Handle("/v1/ws", h)
+	mux.Handle("/v1/stream", h)
 	ln, err := net.Listen("tcp", *listen)
 	if err != nil {
 		return err
