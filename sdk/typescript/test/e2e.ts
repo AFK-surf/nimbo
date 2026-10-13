@@ -152,9 +152,20 @@ export const e2eTests: Test[] = [
         const g = await a.client.transfer(await a.client.mint({ durable: true }), b.key.publicKey, { durable: true });
         a.client.close();
         await until(() => a.client.state === "closed", "a closed");
-        const sent = await b.client.send(g, { x: 1 }, { ttlMs: 300 });
-        const bounce = await b.bounces.next();
-        eq(bounce, { msg: sent.msg, reason: "ttl_expired" }, "bounce");
+        // close() returns before a's Broker has seen the close frame (WebKit
+        // sends it late), and a message that reaches a's session before then
+        // is written to it, not bounced. So send until one bounces.
+        const sent = new Set<string>();
+        let bounce: Bounce | undefined;
+        for (let i = 0; !bounce; i++) {
+          sent.add((await b.client.send(g, { x: i }, { ttlMs: 300 })).msg);
+          bounce = await b.bounces.next(3000).catch((err: unknown) => {
+            if (i >= 4) throw err;
+            return undefined;
+          });
+        }
+        eq(bounce.reason, "ttl_expired", "bounce reason");
+        assert(sent.has(bounce.msg), `bounce for ${bounce.msg}, which b did not send`);
       });
     },
   },
