@@ -20,7 +20,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p test/tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json && tsc -p test/tsconfig.json",
     "test:node": "npm run build && node test/node.ts",
     "test:bun": "npm run build && bun test/node.ts",
     "test:workers": "npm run build && node test/workers.ts",
