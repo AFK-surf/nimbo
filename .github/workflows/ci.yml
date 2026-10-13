@@ -65,6 +65,26 @@ jobs:
       - name: Tailscale-mesh tests
         run: go test -race -count=1 -timeout 10m ./internal/mesh ./internal/host
 
+  cross:
+    # Every supported platform builds with cgo disabled.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [linux/amd64, linux/arm64, darwin/arm64, openbsd/amd64, openbsd/arm64, windows/amd64]
+    name: build ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build
+        env:
+          CGO_ENABLED: "0"
+          TARGET: ${{ matrix.target }}
+        run: GOOS="${TARGET%/*}" GOARCH="${TARGET#*/}" go build ./...
+
   dst:
     runs-on: ubuntu-latest
     # Pull requests and pushes run a small sweep (about 4 minutes in all);
