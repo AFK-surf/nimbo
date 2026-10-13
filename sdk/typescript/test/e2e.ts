@@ -246,11 +246,25 @@ export const e2eTests: Test[] = [
         assert(other instanceof StreamAttachError, `token on another Broker: ${String(other)}`);
 
         // An offer that cannot be delivered: the stream fails with the bounce reason.
+        // As in the bounce test, an offer that reaches c's session before c's
+        // Broker has seen the close frame is delivered there, and that stream
+        // would wait for an attach: try again until one bounces.
         const gone = await grantStream(c, b);
         c.client.close();
         await until(() => c.client.state === "closed", "c closed");
-        const failed = await b.client.openStream(gone, {}, { ttlMs: 300 });
-        const err = await rejects(failed.accepted);
+        let failed: Stream | undefined;
+        let err: unknown;
+        for (let i = 0; !failed; i++) {
+          const st = await b.client.openStream(gone, {}, { ttlMs: 300 });
+          const late = new Promise<"late">((r) => setTimeout(() => r("late"), 3000));
+          const r = await Promise.race([st.accepted.then(() => "accepted" as const, (e: unknown) => e), late]);
+          if (r === "late" && i < 4) {
+            st.close();
+            continue;
+          }
+          failed = st;
+          err = r;
+        }
         assert(err instanceof StreamError && err.reason === "ttl_expired", `got ${String(err)}`);
         eq((await failed.closed).code, StreamCloseCode.ttlExpired, "the holder's socket closes with 4902");
       });
