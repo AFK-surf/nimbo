@@ -1,0 +1,39 @@
+{
+  "name": "@afk-surf/nimbo",
+  "version": "0.1.0",
+  "description": "Nimbo endpoint SDK for Bun, Node and Cloudflare Workers",
+  "license": "UNLICENSED",
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json && tsc -p test/tsconfig.json",
+    "test:node": "npm run build && node test/node.ts",
+    "test:bun": "npm run build && bun test/node.ts",
+    "test:workers": "npm run build && node test/workers.ts",
+    "test": "npm run test:node && npm run test:bun && npm run test:workers"
+  },
+  "dependencies": {
+    "@noble/curves": "^2.4.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261013.1",
+    "@types/node": "^22.20.5",
+    "esbuild": "^0.28.2",
+    "miniflare": "^4.20260730.0",
+    "typescript": "^5.9.3"
+  }
+}
