@@ -50,6 +50,7 @@ func startClusterOpts(t *testing.T, n int, tailscale bool, tweak func(*node.Conf
 		var m host.Mesh
 		var endpoints []string
 		var ts *mesh.TS
+		var disco string
 		var info struct {
 			sync.Mutex
 			disco string
@@ -93,7 +94,7 @@ func startClusterOpts(t *testing.T, n int, tailscale bool, tweak func(*node.Conf
 			}
 			m = ts
 			info.Lock()
-			endpoints = info.eps
+			endpoints, disco = info.eps, info.disco
 			info.Unlock()
 			if len(endpoints) == 0 {
 				endpoints = []string{fmt.Sprintf("127.0.0.1:%d", ts.LocalPort())}
@@ -112,7 +113,7 @@ func startClusterOpts(t *testing.T, n int, tailscale bool, tweak func(*node.Conf
 		b.url = "ws://" + authority + "/v1/ws"
 		cfg := node.Config{
 			NodePub:     k.Public[:],
-			Member:      node.MemberInfo{WSURLs: []string{b.url}, Endpoints: endpoints, DiscoPub: info.disco},
+			Member:      node.MemberInfo{WSURLs: []string{b.url}, Endpoints: endpoints, DiscoPub: disco},
 			PublicNames: []string{authority},
 			Tunables:    node.DefaultTunables(),
 			Limits:      node.DefaultLimits(),

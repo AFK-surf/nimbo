@@ -50,7 +50,7 @@ const (
 	ReasonPeerAttachTimeout = "peer_attach_timeout"
 	// ReasonPeerLost: a data connection or the other Broker failed.
 	ReasonPeerLost = "peer_lost"
-	// ReasonCanceled: the holder closed its data socket before pairing.
+	// ReasonCanceled: the holder's data socket was lost before pairing.
 	ReasonCanceled = "canceled"
 	// ReasonStreamRejected is the reason a target refusing a stream uses.
 	ReasonStreamRejected = "stream_rejected"
