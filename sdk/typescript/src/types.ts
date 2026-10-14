@@ -70,6 +70,34 @@ export interface MintOptions extends AbortOptions {
   allowStream?: boolean;
 }
 
+/**
+ * What a delegation proof authorizes (protocol §11): a cap targeting
+ * `target`, held by `holder`, with these parameters, issued by the Broker
+ * `broker` against the challenge `eph`. All keys and hashes are raw bytes.
+ */
+export interface Grant {
+  broker: Uint8Array;
+  eph: Uint8Array;
+  target: Uint8Array;
+  holder: Uint8Array;
+  autoReply: boolean;
+  allowStream: boolean;
+  schemaHash?: Uint8Array;
+  baseHash?: Uint8Array;
+}
+
+/**
+ * Proves ownership of an endpoint key for `delegate`, without handing over
+ * the private key: for example a process that holds the key, checks each
+ * grant (`target` is its key, `holder` the endpoint asking) and returns
+ * `delegationProof(privateKey, grant)`.
+ */
+export interface Prover {
+  /** The endpoint key in base32. */
+  readonly publicKey: string;
+  prove(grant: Grant): Uint8Array | Promise<Uint8Array>;
+}
+
 export interface TransferOptions extends AbortOptions {
   durable?: boolean;
 }

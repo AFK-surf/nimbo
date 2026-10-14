@@ -456,3 +456,80 @@ func (c *Client) Inspect(ctx context.Context, capID string) (*wire.CapInfo, erro
 	}
 	return r.Info, nil
 }
+
+// Prover proves ownership of an endpoint key for delegated issuance (design
+// §8.6). Key is a Prover. One can also live in another process that holds
+// the key, checks each grant (its Target is the key, its Holder the
+// endpoint asking) and returns only the proof.
+type Prover interface {
+	PublicKey() [32]byte
+	ProveDelegation(ctx context.Context, g *wire.Grant) ([]byte, error)
+}
+
+// PublicKey returns the endpoint key.
+func (k Key) PublicKey() [32]byte { return k.Public }
+
+// ProveDelegation computes the delegation proof for g with the private key.
+func (k Key) ProveDelegation(_ context.Context, g *wire.Grant) ([]byte, error) {
+	ss, err := curve25519.X25519(k.Private[:], g.Eph[:])
+	if err != nil {
+		return nil, err
+	}
+	return wire.DelegationProof(ss, g), nil
+}
+
+// Delegate gets a cap that targets the endpoint p proves ownership of and is
+// held by this endpoint, as if that endpoint had minted it with o and
+// transferred it here (design §8.6). The target need not be connected.
+func (c *Client) Delegate(ctx context.Context, p Prover, o MintOptions) (string, error) {
+	var err error
+	// A challenge lives only in the session that asked for it; if the
+	// session drops in between, start over.
+	for range 3 {
+		var capID string
+		capID, err = c.delegate(ctx, p, o)
+		var we *Error
+		if err == nil || !(errors.Is(err, ErrClosed) || errors.As(err, &we) && we.Code == wire.ErrInvalidChallenge) {
+			return capID, err
+		}
+	}
+	return "", err
+}
+
+func (c *Client) delegate(ctx context.Context, p Prover, o MintOptions) (string, error) {
+	target := p.PublicKey()
+	r, err := c.request(ctx, &wire.In{Op: "delegate_begin", Target: ids.B32.EncodeToString(target[:]), Schema: o.Schema, Base: o.Base, AutoReply: o.AutoReply, AllowStream: o.AllowStream})
+	if err != nil {
+		return "", err
+	}
+	g := &wire.Grant{Target: target, Holder: c.opts.Key.Public, AutoReply: o.AutoReply, AllowStream: o.AllowStream}
+	broker, err1 := ids.ParseBrokerID(r.Broker)
+	eph, err2 := ids.ParseKey(r.Eph)
+	if err1 != nil || err2 != nil {
+		return "", errors.New("nimbo: bad delegate_begin result")
+	}
+	g.Broker, g.Eph = broker, eph
+	for _, f := range []struct {
+		s   string
+		dst **[32]byte
+	}{{r.SchemaHash, &g.Schema}, {r.BaseHash, &g.Base}} {
+		if f.s == "" {
+			continue
+		}
+		h, err := ids.ParseHash(f.s)
+		if err != nil {
+			return "", errors.New("nimbo: bad delegate_begin result")
+		}
+		hb := [32]byte(h)
+		*f.dst = &hb
+	}
+	proof, err := p.ProveDelegation(ctx, g)
+	if err != nil {
+		return "", err
+	}
+	r, err = c.request(ctx, &wire.In{Op: "delegate", Eph: r.Eph, Proof: ids.B32.EncodeToString(proof), Durable: o.Durable})
+	if err != nil {
+		return "", err
+	}
+	return r.Cap, nil
+}

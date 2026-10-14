@@ -49,6 +49,10 @@ type Tunables struct {
 	StreamAttachTTL  time.Duration
 	StreamDrainGrace time.Duration
 
+	// DelegationTTL is how long a delegation challenge stays valid
+	// (design §8.6).
+	DelegationTTL time.Duration
+
 	CacheEntries  int
 	SchemaCache   int
 	BatchOps      int
@@ -98,6 +102,8 @@ func DefaultTunables() Tunables {
 		StreamAttachTTL:  60 * time.Second,
 		StreamDrainGrace: 30 * time.Second,
 
+		DelegationTTL: 30 * time.Second,
+
 		CacheEntries:  100000,
 		SchemaCache:   1024,
 		BatchOps:      512,
@@ -135,6 +141,11 @@ type Limits struct {
 	StreamSocketsPerIP     int     // data sockets per client IP
 	StreamAttachFailPerSec float64 // failed attaches per client IP
 	MaxStreamLegs          int     // data-plane connections per Broker
+
+	// Delegated issuance (design §8.6).
+	MaxPendingDelegations int // outstanding challenges per session
+	DelegationsPerSec     float64
+	DelegationsBurst      float64
 }
 
 // DefaultLimits returns the defaults of design §6.4 and §14.
@@ -165,6 +176,10 @@ func DefaultLimits() Limits {
 		StreamSocketsPerIP:     256,
 		StreamAttachFailPerSec: 10,
 		MaxStreamLegs:          100000,
+
+		MaxPendingDelegations: 8,
+		DelegationsPerSec:     10,
+		DelegationsBurst:      20,
 	}
 }
 

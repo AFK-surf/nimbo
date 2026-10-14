@@ -10,6 +10,8 @@ import {
   encodeBase32,
   exportKey,
   generateKey,
+  delegationProof,
+  grantMessage,
   handshakeProof,
   importKey,
 } from "../dist/index.js";
@@ -82,6 +84,24 @@ export const unitTests: Test[] = [
       eq(bPub, "k4khnhirnp3winvoos6hspjmgcwrsa6ftlcsooafy7rgtc2bbq3a", "B_eph_pub");
       const p = await handshakeProof(e, decodeBase32(key.publicKey), decodeBase32(bPub), nonce, "broker.example.com:8443");
       eq(encodeBase32(p), "eduhkxbs7jcu7n3zvn3fakah6lsnxah76bhsbunk7mwm3vb7ymia", "proof");
+    },
+  },
+  {
+    name: "delegation proof matches the Go vector (pkg/wire/proof_test.go)",
+    async fn() {
+      const seq = (base: number) => new Uint8Array(32).map((_, i) => i + base);
+      const target = seq(1);
+      const grant = {
+        broker: seq(151),
+        eph: decodeBase32(importKey(seq(101)).publicKey),
+        target: decodeBase32(importKey(target).publicKey),
+        holder: decodeBase32(importKey(seq(51)).publicKey),
+        autoReply: true,
+        allowStream: false,
+        schemaHash: seq(201),
+      };
+      eq(grantMessage(grant).length, 193, "message length");
+      eq(encodeBase32(delegationProof(target, grant)), "npjdjxyrahv5bzez5amj66h4o6xl4kawcmfl3jknacwwvny5frzq", "proof");
     },
   },
   {

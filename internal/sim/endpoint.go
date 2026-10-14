@@ -347,6 +347,8 @@ func (e *Endpoint) act() {
 	switch {
 	case r < 0.08 || len(e.wallet) == 0:
 		e.doMint(c)
+	case r < 0.10:
+		e.doDelegate(c)
 	case r < 0.22:
 		e.doTransfer(c)
 	case r < 0.63:
@@ -404,6 +406,104 @@ func (e *Endpoint) doMint(c *Conn) {
 		if to := e.w.randomPeer(e); to != nil && e.w.chance(0.8) {
 			e.transfer(c, h, to)
 		}
+	})
+}
+
+// doDelegate gets a cap targeting another endpoint by proving ownership of
+// its key (design §8.6); the simulator knows every key. Now and then the
+// proof is forged, or a used challenge is replayed: neither may succeed.
+func (e *Endpoint) doDelegate(c *Conn) {
+	to := e.w.randomPeer(e)
+	if to == nil {
+		return
+	}
+	in := &wire.In{Op: "delegate_begin", Target: to.key.String(), AutoReply: e.w.chance(0.4), AllowStream: e.w.chance(0.4)}
+	h := &heldCap{target: to, autoReply: in.AutoReply, minted: true, allowStream: in.AllowStream}
+	if e.w.chance(0.3) {
+		in.Schema = json.RawMessage(testSchema)
+		h.schema = true
+	}
+	if e.w.chance(0.3) {
+		e.counter++
+		h.base = fmt.Sprintf("%s-d%d", e.name, e.counter)
+		in.Base = json.RawMessage(fmt.Sprintf(`{"tag":%q}`, h.base))
+	}
+	forge := -1
+	if e.w.chance(0.1) {
+		forge = e.w.rng.IntN(3)
+	}
+	replay := forge < 0 && e.w.chance(0.1)
+	durable := e.w.chance(0.2)
+	e.w.check.stats.Delegations++
+	e.request(c, in, func(out *wire.Out) {
+		if out == nil || !out.OK {
+			e.w.check.noteErr(out)
+			return
+		}
+		broker, err1 := ids.ParseBrokerID(out.Broker)
+		eph, err2 := ids.ParseKey(out.Eph)
+		if err1 != nil || err2 != nil || broker != c.b.id || (out.SchemaHash != "") != h.schema || (out.BaseHash != "") != (h.base != "") {
+			e.w.check.violate("%s: bad delegate_begin result %+v", e.name, out)
+			return
+		}
+		g := &wire.Grant{Broker: broker, Eph: eph, Target: to.key, Holder: e.key, AutoReply: h.autoReply, AllowStream: h.allowStream}
+		if out.SchemaHash != "" {
+			sh, _ := ids.ParseHash(out.SchemaHash)
+			g.Schema = (*[32]byte)(&sh)
+		}
+		if out.BaseHash != "" {
+			bh, _ := ids.ParseHash(out.BaseHash)
+			g.Base = (*[32]byte)(&bh)
+		}
+		priv := to.priv
+		switch forge {
+		case 0: // the wrong key
+			priv = e.priv
+		case 1: // a grant other than the one requested
+			g.AutoReply = !g.AutoReply
+		case 2: // for another holder
+			g.Holder = to.key
+		}
+		ss, err := curve25519.X25519(priv[:], eph[:])
+		if err != nil {
+			return
+		}
+		fin := &wire.In{Op: "delegate", Eph: out.Eph, Proof: ids.B32.EncodeToString(wire.DelegationProof(ss, g)), Durable: durable}
+		e.request(c, fin, func(out *wire.Out) {
+			if out == nil {
+				return
+			}
+			if forge >= 0 {
+				if out.OK {
+					e.w.check.violate("%s: forged delegation (%d) for %s accepted", e.name, forge, to.name)
+				}
+				return
+			}
+			if !out.OK {
+				if out.Error != nil && out.Error.Code == wire.ErrBadProof {
+					e.w.check.violate("%s: valid delegation proof rejected", e.name)
+				}
+				e.w.check.noteErr(out)
+				return
+			}
+			id, err := ids.ParseCapID(out.Cap)
+			if err != nil {
+				e.w.check.violate("delegate returned bad id %q", out.Cap)
+				return
+			}
+			e.w.check.stats.DelegationsOK++
+			h.id = id
+			h.lineage = ids.Lineage(id)
+			e.addCap(h)
+			if replay {
+				fin := *fin
+				e.request(c, &fin, func(out *wire.Out) {
+					if out != nil && out.OK {
+						e.w.check.violate("%s: replayed delegation challenge accepted", e.name)
+					}
+				})
+			}
+		})
 	})
 }
 

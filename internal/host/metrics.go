@@ -49,6 +49,7 @@ func (h *Host) MetricsHandler() http.Handler {
 		c("messages_held_total", "Messages held for a reconnecting target.", s.Held)
 		c("caps_minted_total", "Caps minted.", s.Minted)
 		c("caps_transferred_total", "Caps transferred.", s.Transferred)
+		c("caps_delegated_total", "Caps issued by delegation.", s.Delegated)
 		c("reply_caps_total", "Single-use reply caps created.", s.Replies)
 		c("lookups_remote_total", "Record lookups sent to other Brokers.", s.LookupsRemote)
 		c("lookups_unresolved_total", "Lookups that ended unavailable.", s.LookupsUnresolved)

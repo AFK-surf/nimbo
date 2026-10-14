@@ -222,7 +222,7 @@ type Node struct {
 // Stats are counters for metrics and tests.
 type Stats struct {
 	Delivered, Forwarded, Bounced, Dropped, Held uint64
-	Minted, Transferred, Replies                 uint64
+	Minted, Transferred, Replies, Delegated      uint64
 	LookupsRemote, LookupsUnresolved             uint64
 	Fenced                                       uint64
 	ViewChanges                                  uint64

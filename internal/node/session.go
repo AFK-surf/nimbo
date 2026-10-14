@@ -42,6 +42,10 @@ type session struct {
 	pendingSend int
 	// holder halves this session opened that have not paired or failed
 	pendingStreams int
+
+	// delegation challenges this session asked for, by their public key
+	delegs      *bucket
+	delegations map[ids.Key]*delegation
 }
 
 func (n *Node) allowlisted(ip netip.Addr) bool {
@@ -148,6 +152,10 @@ func (n *Node) OnSessionFrame(id SessionID, data []byte) {
 		n.actRenew(s, &in)
 	case "inspect":
 		n.actInspect(s, &in)
+	case "delegate_begin":
+		n.actDelegateBegin(s, &in)
+	case "delegate":
+		n.actDelegate(s, &in)
 	default:
 		n.fail(s, in.Rid, wire.ErrBadRequest, "unknown op")
 	}
@@ -190,6 +198,8 @@ func (n *Node) establish(s *session, in *wire.In) {
 	}
 	s.actions = newBucket(n.lim.ActionsPerSec, n.lim.ActionsBurst, now)
 	s.mints = newBucket(n.lim.MintsPerSec, n.lim.MintsBurst, now)
+	s.delegs = newBucket(n.lim.DelegationsPerSec, n.lim.DelegationsBurst, now)
+	s.delegations = map[ids.Key]*delegation{}
 	s.window = now
 	s.usedCaps = map[ids.CapID]bool{}
 	s.created = map[ids.CapID]bool{}

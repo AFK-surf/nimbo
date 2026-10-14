@@ -30,6 +30,11 @@ const (
 	ErrUnavailable     = "unavailable"
 	// ErrStreamNotAllowed: stream on a cap without allow_stream.
 	ErrStreamNotAllowed = "stream_not_allowed"
+	// ErrInvalidChallenge: delegate named a delegation challenge that is
+	// unknown, used, expired or from another session.
+	ErrInvalidChallenge = "invalid_challenge"
+	// ErrBadProof: a delegation proof does not match.
+	ErrBadProof = "bad_proof"
 )
 
 // Bounce reasons.
@@ -135,6 +140,11 @@ type In struct {
 
 	// transfer
 	To string `json:"to,omitempty"`
+
+	// delegate_begin: the endpoint key the delegated cap targets (with the
+	// mint fields above). delegate: the challenge's Eph and the Proof.
+	Target string `json:"target,omitempty"`
+	Eph    string `json:"eph,omitempty"`
 }
 
 // ReplyOpts configure the single-use reply cap of a send.
@@ -221,6 +231,14 @@ type Result struct {
 	// stream: the stream ID and the holder's data-socket token.
 	Stream string `json:"stream,omitempty"`
 	Token  string `json:"token,omitempty"`
+	// delegate_begin: the challenge (a Broker ephemeral X25519 key), this
+	// Broker's ID (hex), the blob hashes of the requested schema and base,
+	// and how long the challenge stays valid.
+	Eph        string `json:"eph,omitempty"`
+	Broker     string `json:"broker,omitempty"`
+	SchemaHash string `json:"schema_hash,omitempty"`
+	BaseHash   string `json:"base_hash,omitempty"`
+	TTLms      int64  `json:"ttl_ms,omitempty"`
 }
 
 type Deliver struct {
@@ -292,6 +310,10 @@ type Out struct {
 	// bounce, closing, stream_status
 	Reason       string `json:"reason,omitempty"`
 	RetryAfterMs int64  `json:"retry_after_ms,omitempty"`
+	// delegate_begin result (with Eph and Broker above)
+	SchemaHash string `json:"schema_hash,omitempty"`
+	BaseHash   string `json:"base_hash,omitempty"`
+	TTLms      int64  `json:"ttl_ms,omitempty"`
 }
 
 // Proof computes the hello proof:
@@ -303,5 +325,71 @@ func Proof(ss, nonce []byte, authority string, ePub, bEph []byte) []byte {
 	m.Write([]byte(authority))
 	m.Write(ePub)
 	m.Write(bEph)
+	return m.Sum(nil)
+}
+
+// Grant is what a delegation proof authorizes: a cap targeting Target, held
+// by Holder, with these parameters, issued by Broker against the challenge
+// Eph (design §8.6).
+type Grant struct {
+	Broker      [32]byte
+	Eph         [32]byte
+	Target      [32]byte
+	Holder      [32]byte
+	AutoReply   bool
+	AllowStream bool
+	Schema      *[32]byte // blob hash of the schema, if any
+	Base        *[32]byte // blob hash of the base, if any
+}
+
+// Grant flag bits.
+const (
+	GrantAutoReply   = 1 << 0
+	GrantAllowStream = 1 << 1
+	GrantHasSchema   = 1 << 2
+	GrantHasBase     = 1 << 3
+)
+
+// Message is the grant as the delegation proof covers it:
+// broker_id ‖ eph ‖ target ‖ holder ‖ flags ‖ schema_hash ‖ base_hash, with
+// 32 zero bytes for a missing hash. It is 193 bytes.
+func (g *Grant) Message() []byte {
+	b := make([]byte, 0, 193)
+	b = append(b, g.Broker[:]...)
+	b = append(b, g.Eph[:]...)
+	b = append(b, g.Target[:]...)
+	b = append(b, g.Holder[:]...)
+	var flags byte
+	if g.AutoReply {
+		flags |= GrantAutoReply
+	}
+	if g.AllowStream {
+		flags |= GrantAllowStream
+	}
+	if g.Schema != nil {
+		flags |= GrantHasSchema
+	}
+	if g.Base != nil {
+		flags |= GrantHasBase
+	}
+	b = append(b, flags)
+	var zero [32]byte
+	for _, h := range []*[32]byte{g.Schema, g.Base} {
+		if h != nil {
+			b = append(b, h[:]...)
+		} else {
+			b = append(b, zero[:]...)
+		}
+	}
+	return b
+}
+
+// DelegationProof computes the proof of a delegated issuance:
+// HMAC-SHA256(SHA-256("nimbo/v1/delegate" ‖ ss), grant message), where
+// ss = X25519(target_priv, eph).
+func DelegationProof(ss []byte, g *Grant) []byte {
+	k := sha256.Sum256(append([]byte("nimbo/v1/delegate"), ss...))
+	m := hmac.New(sha256.New, k[:])
+	m.Write(g.Message())
 	return m.Sum(nil)
 }

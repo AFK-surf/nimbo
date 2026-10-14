@@ -31,3 +31,32 @@ func TestProofVector(t *testing.T) {
 		}
 	}
 }
+
+// TestDelegationProofVector pins the delegation proof (design §8.6) for fixed
+// inputs. The TypeScript SDK's tests check the same vector.
+func TestDelegationProofVector(t *testing.T) {
+	b32 := base32.NewEncoding("abcdefghijklmnopqrstuvwxyz234567").WithPadding(base32.NoPadding)
+	var target, eph, holder, broker, schema [32]byte
+	for i := range 32 {
+		target[i], eph[i], holder[i], broker[i], schema[i] = byte(i+1), byte(i+101), byte(i+51), byte(i+151), byte(i+201)
+	}
+	targetPub, _ := curve25519.X25519(target[:], curve25519.Basepoint)
+	ephPub, _ := curve25519.X25519(eph[:], curve25519.Basepoint)
+	holderPub, _ := curve25519.X25519(holder[:], curve25519.Basepoint)
+	ss, err := curve25519.X25519(target[:], ephPub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := Grant{Broker: broker, Eph: [32]byte(ephPub), Target: [32]byte(targetPub), Holder: [32]byte(holderPub), AutoReply: true, Schema: &schema}
+	if n := len(g.Message()); n != 193 {
+		t.Fatalf("message is %d bytes", n)
+	}
+	if got, want := b32.EncodeToString(DelegationProof(ss, &g)), "npjdjxyrahv5bzez5amj66h4o6xl4kawcmfl3jknacwwvny5frzq"; got != want {
+		t.Errorf("proof = %s, want %s", got, want)
+	}
+	// The Broker's side of the agreement gives the same proof.
+	ss2, _ := curve25519.X25519(eph[:], targetPub)
+	if b32.EncodeToString(DelegationProof(ss2, &g)) != b32.EncodeToString(DelegationProof(ss, &g)) {
+		t.Error("the two sides disagree")
+	}
+}

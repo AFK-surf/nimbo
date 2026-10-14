@@ -7,5 +7,5 @@ export type { ErrorCode, ProtocolErrorCode } from "./errors.js";
 export { exportKey, generateKey, importKey } from "./key.js";
 export type { EndpointKey } from "./key.js";
 export { decodeBase32, encodeBase32 } from "./base32.js";
-export { handshakeProof } from "./proof.js";
+export { delegationProof, grantMessage, handshakeProof } from "./proof.js";
 export type * from "./types.js";
