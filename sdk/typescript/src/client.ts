@@ -1,7 +1,8 @@
 import { decodeBase32, encodeBase32 } from "./base32.js";
 import { ClientClosedError, NimboError, SessionClosedError } from "./errors.js";
 import type { EndpointKey } from "./key.js";
-import { handshakeProof } from "./proof.js";
+import { hexToBytes } from "@noble/hashes/utils.js";
+import { delegationProof, handshakeProof } from "./proof.js";
 import { Stream, StreamCloseCode, StreamError, streamURL } from "./stream.js";
 import type { AttachOptions, DataSocketConstructor } from "./stream.js";
 import type {
@@ -11,10 +12,12 @@ import type {
   ClientEvents,
   ClientState,
   Delivery,
+  Grant,
   JsonObject,
   Limits,
   MintOptions,
   OpenStreamOptions,
+  Prover,
   RenewItem,
   RequestOptions,
   SendOptions,
@@ -217,6 +220,61 @@ export class Client {
       options.signal,
     );
     return r.cap as string;
+  }
+
+  /**
+   * Gets a cap that targets the endpoint `target` and is held by this one, as
+   * if `target` had minted it with `options` and transferred it here
+   * (protocol §11). `target` is that endpoint's key, or a `Prover` for it.
+   * The target need not be connected. Returns the cap ID (also its lineage
+   * ID, which the target sees as `deliver.on`).
+   */
+  async delegate(target: EndpointKey | Prover, options: MintOptions = {}): Promise<string> {
+    const prove =
+      "privateKey" in target
+        ? (g: Grant) => delegationProof(target.privateKey, g)
+        : (g: Grant) => target.prove(g);
+    // A challenge lives only in the session that asked for it; if the
+    // session drops in between, start over.
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await this.#delegate(target.publicKey, prove, options);
+      } catch (err) {
+        const again = err instanceof SessionClosedError || (err instanceof NimboError && err.code === "invalid_challenge");
+        if (!again || attempt >= 3) throw err;
+      }
+    }
+  }
+
+  async #delegate(target: string, prove: (g: Grant) => Uint8Array | Promise<Uint8Array>, options: MintOptions): Promise<string> {
+    const r = await this.#request(
+      {
+        op: "delegate_begin",
+        target,
+        schema: options.schema,
+        base: options.base,
+        auto_reply: options.autoReply || undefined,
+        allow_stream: options.allowStream || undefined,
+      },
+      options.signal,
+    );
+    const grant: Grant = {
+      broker: hexToBytes(r.broker as string),
+      eph: decodeBase32(r.eph as string),
+      target: decodeBase32(target),
+      holder: decodeBase32(this.#opts.key.publicKey),
+      autoReply: !!options.autoReply,
+      allowStream: !!options.allowStream,
+      schemaHash: r.schema_hash ? decodeBase32(r.schema_hash as string) : undefined,
+      baseHash: r.base_hash ? decodeBase32(r.base_hash as string) : undefined,
+    };
+    const proof = await prove(grant);
+    options.signal?.throwIfAborted();
+    const f = await this.#request(
+      { op: "delegate", eph: r.eph, proof: encodeBase32(proof), durable: options.durable || undefined },
+      options.signal,
+    );
+    return f.cap as string;
   }
 
   /** Gives the endpoint `to` (a base32 endpoint key) a new cap for the same target. Returns its ID. */

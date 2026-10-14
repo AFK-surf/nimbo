@@ -84,6 +84,17 @@ Result: `{"cap":"<new cap id>"}`, held by `to`. The Broker does not check whethe
 
 `durable: true` (mint and transfer) returns only once two members of the cap's placement set hold the record, so the ID can be used from any Broker immediately. Use it whenever the ID leaves the session out of band.
 
+### delegate_begin, delegate (delegated issuance)
+
+Get a cap that targets another endpoint, by proving ownership of its key (§11).
+
+```json
+{"op":"delegate_begin","rid":7,"target":"<endpoint key>","schema":{...},"base":{...},"auto_reply":true,"allow_stream":false}
+{"op":"delegate","rid":8,"eph":"<from the delegate_begin result>","proof":"<32 bytes, b32>","durable":true}
+```
+
+`delegate_begin` takes the same `schema`, `base`, `auto_reply` and `allow_stream` as `mint`, checked the same way. Result: `{"eph":"<32 bytes, b32>","broker":"<broker id hex>","schema_hash":"<b32>","base_hash":"<b32>","ttl_ms":30000}` (the hashes only when a schema or base was given). `delegate` result: `{"cap":"<cap id>"}`, a cap held by the caller that targets `target`.
+
 ### renew (RenewCap)
 
 ```json
@@ -141,10 +152,12 @@ A `deliver` with `stream` is a stream offer: accept it, refuse it or ignore it (
 | `rate_limited` | a per-session or per-IP limit was hit | after a pause |
 | `unavailable` | could not reach enough Brokers, overload, unknown target state | yes, with backoff |
 | `stream_not_allowed` | `stream` on a cap without `allow_stream` | no |
+| `invalid_challenge` | `delegate` with a challenge that is unknown, used, expired or from another session | start over with `delegate_begin` |
+| `bad_proof` | the delegation proof does not match | no |
 
 ## 8. Limits (defaults)
 
-Payload ≤ 64 KiB; ≤ 16 carried caps; schema ≤ 32 KiB; base ≤ 4 KiB; 64 KiB of new schema/base bytes per session per 10s; 1000 actions/s and 100 mints/s per session; 4096 distinct caps used per session per 10s; 100 lookups of unknown cap IDs per session per 10s; 10,000 live caps created per session; 64 sessions and 20 handshakes/s (burst 200) per client IP. Streams: 64 pending (not yet accepted) streams per session; 16 unanswered offers per endpoint per Broker (more bounce with `receiver_busy`); tokens valid 60s; 256 data sockets and 10 failed attaches/s per client IP. `welcome.limits` includes `max_pending_streams`, `stream_attach_ttl_ms` and `stream_sockets_per_ip`.
+Payload ≤ 64 KiB; ≤ 16 carried caps; schema ≤ 32 KiB; base ≤ 4 KiB; 64 KiB of new schema/base bytes per session per 10s; 1000 actions/s and 100 mints/s per session; 4096 distinct caps used per session per 10s; 100 lookups of unknown cap IDs per session per 10s; 10,000 live caps created per session; 64 sessions and 20 handshakes/s (burst 200) per client IP. Streams: 64 pending (not yet accepted) streams per session; 16 unanswered offers per endpoint per Broker (more bounce with `receiver_busy`); tokens valid 60s; 256 data sockets and 10 failed attaches/s per client IP. `welcome.limits` includes `max_pending_streams`, `stream_attach_ttl_ms` and `stream_sockets_per_ip`. Delegation: 8 outstanding challenges per session, 10 `delegate_begin` per second per session (each also counts as a mint), challenges valid 30s.
 
 ## 9. Delivery semantics
 
@@ -185,3 +198,21 @@ Codes 4900–4999 other than 4901 are reserved for Brokers; an endpoint that sen
 
 **Semantics.** Reliable and ordered while the stream is up; data in flight at a close or failure may be lost and is never retried. No size limit per message. A stream outlives the cap and both sessions once attached; it ends when either side closes or a hop fails. WebSocket has no half-close: a close from either side ends the stream. Brokers ping data sockets every 20s.
 
+
+## 11. Delegated issuance
+
+An endpoint A that holds another endpoint B's private key can get a cap that **targets B and is held by A**, without B connecting. The cap is the one B would get by minting it and transferring it to A: `kind` is `mint`, its ID is its lineage ID, and B sees that ID as `deliver.on`. Anyone with B's key could already do that by opening a session as B; delegation spares a second session, which would also receive B's messages while it is open.
+
+1. A sends `delegate_begin` with `target` = B's key and the cap's parameters (§4). The Broker checks them as for `mint`, stores the schema and base, and answers with a challenge: a fresh, single-use X25519 key `D_eph`, its own Broker ID, and the hashes of the schema and base.
+2. With B's private key, compute:
+   - `ss = X25519(B_priv, D_eph_pub)`. Abort if `ss` is all zeros.
+   - `k = SHA-256("nimbo/v1/delegate" ‖ ss)` (17 ASCII bytes, then the 32 bytes of `ss`).
+   - `grant = broker_id ‖ D_eph_pub ‖ B_pub ‖ A_pub ‖ flags ‖ schema_hash ‖ base_hash` (193 bytes). `broker_id` is the 32 bytes of the hex `broker`. `flags` is one byte: bit 0 `auto_reply`, bit 1 `allow_stream`, bit 2 a schema is set, bit 3 a base is set. A missing hash is 32 zero bytes.
+   - `proof = HMAC-SHA256(k, grant)`.
+3. A sends `delegate` with `eph` = `D_eph_pub` and the proof, on **the same session**, within `ttl_ms`. The Broker computes the same key agreement from its side, and on a match issues the cap. `durable` works as for `mint`.
+
+The proof covers the holder and the parameters, so it authorizes exactly one grant: a process that holds B's key can check `grant` (B is its key, A the endpoint it serves) and hand A only the proof. The label differs from the hello proof's, so neither proof stands in for the other.
+
+A challenge is used once: any `delegate` naming it spends it, whatever the outcome. A challenge that is unknown, spent, expired or from another session fails with `invalid_challenge`; a proof that does not match fails with `bad_proof`. The target need not be connected or ever have been. Delegation needs nothing beyond X25519, HMAC-SHA256 and SHA-256. A Broker that predates it answers `bad_request` (`unknown op`).
+
+Test vector (`pkg/wire/proof_test.go`): `B_priv`, `D_eph_priv` and `A_priv` are the bytes 1…32, 101…132 and 51…82; `broker_id` is 151…182; `auto_reply` is set, with a schema whose hash is 201…232 and no base. The proof is `npjdjxyrahv5bzez5amj66h4o6xl4kawcmfl3jknacwwvny5frzq`.

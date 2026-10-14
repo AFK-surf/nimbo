@@ -248,6 +248,7 @@ type Stats struct {
 	ExpectedGone, ReplicationChecked               int
 	Crashes, Partitions, S3Outages, Skews, Drains  int
 	Rotations, Churns, LinkResets                  int
+	Delegations, DelegationsOK                     int
 	Errors                                         map[string]int
 	BrokerDelivered, BrokerForwarded, BrokerHinted uint64
 	// Peer traffic by message kind (frames and bytes), and RCR ops by kind.
@@ -265,8 +266,8 @@ func (r *Result) String() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "seed=%d trace=%s steps=%d\n", r.Seed, r.Trace[:16], r.Steps)
 	s := r.Stats
-	fmt.Fprintf(&b, "  sends=%d ok=%d delivered=%d bounced=%d replies=%d mints=%d transfers=%d renews=%d attacks=%d\n",
-		s.Sends, s.SendOK, s.Delivered, s.Bounced, s.Replies, s.Mints, s.Transfers, s.Renews, s.Attacks)
+	fmt.Fprintf(&b, "  sends=%d ok=%d delivered=%d bounced=%d replies=%d mints=%d delegations=%d/%d transfers=%d renews=%d attacks=%d\n",
+		s.Sends, s.SendOK, s.Delivered, s.Bounced, s.Replies, s.Mints, s.DelegationsOK, s.Delegations, s.Transfers, s.Renews, s.Attacks)
 	fmt.Fprintf(&b, "  quiet-phase expected=%d ok=%d delivered=%d\n", s.Expected, s.ExpectedOK, s.ExpectedDelivered)
 	fmt.Fprintf(&b, "  faults: crashes=%d partitions=%d s3outages=%d skews=%d drains=%d rotations=%d churns=%d linkresets=%d\n",
 		s.Crashes, s.Partitions, s.S3Outages, s.Skews, s.Drains, s.Rotations, s.Churns, s.LinkResets)

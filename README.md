@@ -47,6 +47,8 @@ capID, _ := c.Mint(ctx, client.MintOptions{AutoReply: true})
 granted, _ := c.Transfer(ctx, capID, otherEndpointKey, true) // hand `granted` to the other endpoint
 ```
 
+An endpoint that holds another endpoint's key (for example an orchestrator that generated a sandbox's key) can get a cap to it without that endpoint connecting: `c.Delegate(ctx, sandboxKey, client.MintOptions{...})` returns a cap that targets the sandbox and is held by `c`, issued against a proof of the key ([protocol §11](docs/protocol.md#11-delegated-issuance)).
+
 Streams: the target mints with `AllowStream: true`; the holder opens, the target accepts the offer it receives:
 
 ```go
@@ -64,6 +66,7 @@ const client = new Client({ url: "wss://broker1.example.com/v1/ws", key: generat
 client.on("deliver", (d) => { /* d.on, d.payload, d.respond(...) */ });
 const cap = await client.mint({ autoReply: true });
 const granted = await client.transfer(cap, otherEndpointKey, { durable: true });
+const toSandbox = await client.delegate(sandboxKey, { durable: true }); // a cap to an endpoint whose key we hold
 ```
 
 Streams work the same way: `client.openStream(cap, payload)` on the holder, `d.acceptStream()` (or `d.rejectStream(reason)`) on an offer at the target.

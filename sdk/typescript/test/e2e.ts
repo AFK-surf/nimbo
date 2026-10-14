@@ -1,7 +1,16 @@
 // End-to-end tests against a real cluster (cmd/nimbo-devcluster).
 
-import { Client, NimboError, StreamAttachError, StreamCloseCode, StreamError, encodeBase32, generateKey } from "../dist/index.js";
-import type { Bounce, Delivery, DisconnectEvent, EndpointKey, Stream, StreamMessage } from "../dist/index.js";
+import {
+  Client,
+  NimboError,
+  StreamAttachError,
+  StreamCloseCode,
+  StreamError,
+  delegationProof,
+  encodeBase32,
+  generateKey,
+} from "../dist/index.js";
+import type { Bounce, Delivery, DisconnectEvent, EndpointKey, Grant, Stream, StreamMessage } from "../dist/index.js";
 import { Inbox, assert, eq, rejects, until } from "./harness.ts";
 import type { Test } from "./harness.ts";
 
@@ -57,6 +66,51 @@ async function nextOffer(e: Ep): Promise<Delivery> {
 const bytes = (...b: number[]) => new Uint8Array(b);
 
 export const e2eTests: Test[] = [
+  {
+    name: "e2e: delegate a cap to a sandbox before it connects",
+    async fn({ urls }) {
+      await withEndpoints([urls[0]!], async (orch) => {
+        const sandboxKey = generateKey();
+        let cap = "";
+        for (let i = 0; ; i++) {
+          try {
+            cap = await orch.client.delegate(sandboxKey, { base: { from: "orch" }, autoReply: true, durable: true });
+            break;
+          } catch (err) {
+            if (!(err instanceof NimboError && err.code === "unavailable") || i >= 10) throw err;
+          }
+        }
+        const info = await orch.client.inspect(cap);
+        eq([info.kind, info.target, info.holder, info.lineage], ["mint", sandboxKey.publicKey, orch.key.publicKey, cap], "inspect");
+
+        const sandbox = new Client({ url: urls[1]!, key: sandboxKey, backoffBaseMs: 50 });
+        try {
+          sandbox.on("deliver", (d) => {
+            if (d.on === cap && d.reply) void d.respond({ pong: d.payload.ping as number });
+          });
+          const r = await orch.client.request(cap, { ping: 1 }, { timeoutMs: 10_000 });
+          eq(r.payload, { pong: 1 }, "the sandbox answers on the delegated cap");
+        } finally {
+          sandbox.close();
+        }
+
+        // A Prover keeps the key elsewhere; a proof for another grant fails.
+        const prover = (tamper?: (g: Grant) => void) => ({
+          publicKey: sandboxKey.publicKey,
+          prove(g: Grant) {
+            tamper?.(g);
+            return delegationProof(sandboxKey.privateKey, g);
+          },
+        });
+        const viaProver = await orch.client.delegate(prover(), { allowStream: true });
+        eq((await orch.client.inspect(viaProver)).allowStream, true, "delegated through a Prover");
+        const bad = await rejects(orch.client.delegate(prover((g) => (g.allowStream = false)), { allowStream: true }));
+        assert(bad instanceof NimboError && bad.code === "bad_proof", `got ${String(bad)}`);
+        const wrong = await rejects(orch.client.delegate({ publicKey: sandboxKey.publicKey, prove: (g) => delegationProof(generateKey().privateKey, g) }));
+        assert(wrong instanceof NimboError && wrong.code === "bad_proof", `got ${String(wrong)}`);
+      });
+    },
+  },
   {
     name: "e2e: mint, durable transfer, send and reply across Brokers",
     async fn({ urls }) {

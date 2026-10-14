@@ -2,7 +2,7 @@
 
 Nimbo is a distributed, capability-based messaging fabric for AI agents, isolated runtimes and external devices. This document refines the concept notes into a design that can be built. It is written in Go and ships as one binary, `nimbod`.
 
-Status: revision 8, implemented in this repository. Revision 5 incorporated the fixes from the [design review](review.md). Revision 6 records what building and simulation-testing it changed; those changes are listed in [§16](#16-changes-from-implementation-and-dst-revision-6) and marked **(rev 6)** where they apply. Revision 7 added the membership signal (§4). Revision 8 adds streams ([§9.7](#97-streams-rev-8)), marked **(rev 8)**; what building them changed from the proposal is in [§17](#17-streams-as-built-revision-8). The decisions taken with the project owner are listed in [§13](#13-decision-log). Defaults chosen without the owner, which are open to change, are in [§14](#14-defaults-open-to-change).
+Status: revision 9, implemented in this repository. Revision 5 incorporated the fixes from the [design review](review.md). Revision 6 records what building and simulation-testing it changed; those changes are listed in [§16](#16-changes-from-implementation-and-dst-revision-6) and marked **(rev 6)** where they apply. Revision 7 added the membership signal (§4). Revision 8 adds streams ([§9.7](#97-streams-rev-8)), marked **(rev 8)**; what building them changed from the proposal is in [§17](#17-streams-as-built-revision-8). Revision 9 adds delegated issuance ([§8.6](#86-delegated-issuance-rev-9)), marked **(rev 9)**. The decisions taken with the project owner are listed in [§13](#13-decision-log). Defaults chosen without the owner, which are open to change, are in [§14](#14-defaults-open-to-change).
 
 ---
 
@@ -192,6 +192,8 @@ Requests carry a client-chosen `rid`. Each gets exactly one `result`: `{"op":"re
 | `transfer` (**TransferCap**) | `cap`, `to` (Endpoint key), `durable` (bool, optional) | `cap`: a new cap ID bound to `to`, meaningful only to that Endpoint. Transferring a single-use cap consumes it (§8.3). |
 | `renew` (**RenewCap**) | `caps` (array of cap IDs) | per-cap `{ok, ttl_ms}` or an error. The IDs do not change. |
 | `inspect` | `cap` | the record (with schema and base resolved) and remaining TTL (debugging and SDK convenience) |
+| `delegate_begin` (**rev 9**) | `target` (Endpoint key), and `schema`, `base`, `auto_reply`, `allow_stream` as for `mint` | a challenge: `eph` (a single-use Broker X25519 key), `broker` (Broker ID), `schema_hash`, `base_hash`, `ttl_ms` (§8.6) |
+| `delegate` (**rev 9**) | `eph`, `proof`, `durable` (bool, optional) | `cap`: a new cap ID held by the caller and targeting `target` |
 
 `durable: true` makes the call wait until **two members of the placement set** (or all of them, if fewer) hold the new record, counting the issuer if it is one. Without it the record can be lost if the issuing Broker crashes within milliseconds. Use it in bootstrap flows where the ID is handed out of band. **(rev 6)** Revision 5 waited for one remote acknowledgement; with an issuer outside the placement set, two members could then still answer "not found" and a lookup from another Broker could return `invalid_cap` for a valid cap.
 
@@ -204,7 +206,7 @@ Requests carry a client-chosen `rid`. Each gets exactly one `result`: `{"op":"re
 | `closing` | `reason`, `retry_after_ms` (jittered) |
 
 **Error codes:**
-- `bad_request`, `invalid_cap` (the placement set positively confirmed the cap does not exist), `not_holder`, `expired`, `consumed` (a single-use cap was already used), `target_gone`, `schema_violation`, `base_conflict`, `too_large`, `rate_limited`, `stream_not_allowed` (**rev 8**).
+- `bad_request`, `invalid_cap` (the placement set positively confirmed the cap does not exist), `not_holder`, `expired`, `consumed` (a single-use cap was already used), `target_gone`, `schema_violation`, `base_conflict`, `too_large`, `rate_limited`, `stream_not_allowed` (**rev 8**), `invalid_challenge` and `bad_proof` (**rev 9**).
 - `unavailable` is retryable. It covers lookups that could not reach a quorum of answers, unresolvable blobs, overload, and a target whose state is unknown.
 
 ### 6.4 Limits (defaults, from `welcome.limits`)
@@ -215,6 +217,7 @@ Requests carry a client-chosen `rid`. Each gets exactly one `result`: `{"op":"re
 - **Per client IP:** 64 concurrent sessions and 20 handshakes/s with a burst of 200, so a NAT'd fleet can reconnect after a Broker failure. Both are configurable, with an allowlist for known service networks.
 - **Per Broker:** a mint admission rate (default 20k records/s), and bounded per-peer replication queues. When either is exhausted, new mints, transfers and auto-reply sends fail with `unavailable`. Overload causes back-pressure, not unbounded memory.
 - **Queues:** the delivery queue is 1000 messages or 1 MiB per session. Held messages are capped at 100 per target per Broker.
+- **Delegation (rev 9):** 8 outstanding challenges per session, and 10 `delegate_begin`/s per session, each also counted as a mint. Challenges are valid for `delegation_ttl` (30s).
 - **Streams (rev 8):** 64 pending holder halves per session (`rate_limited`); 16 unattached target halves per target per Broker (further offers bounce with `receiver_busy`); `stream_attach_ttl` 60s; 256 data sockets per client IP and 10 failed attaches/s per IP (then 429); 100,000 data-plane legs per Broker.
 
 ---
@@ -379,6 +382,30 @@ Given a cap ID presented by session `S`, authenticated as Endpoint key `K`:
 
 **No revocation.** As decided, there is no RevokeCap. A cap in use lives indefinitely. An Endpoint withdraws access by disconnecting and rotating its ephemeral key, after which caps to it die with `target_gone`. Applications that need per-client withdrawal can mint one cap per client with a distinguishing `base` field and ignore messages from withdrawn clients.
 
+### 8.6 Delegated issuance (rev 9)
+
+An Endpoint A that holds another Endpoint B's private key can get a cap **targeting B and held by A**, without B connecting. A typical user is an orchestrator that generated a sandbox's key and wants a cap to the sandbox before the sandbox has minted one and sent it back.
+
+**No new authority.** The cap is exactly what B would produce by minting and transferring to A, and anyone with B's key can already open a session as B and do that. Delegation spares the second session and handshake. It also avoids the harm that session does: it registers presence for B, and egress picks the target's newest session (§9.3), so it would receive B's messages while it is open.
+
+**Protocol.**
+1. A sends `delegate_begin` with `target` = B and the cap's parameters. The Broker applies the `mint` checks (sizes, schema compiles, blob budget, mint rate) and writes the blobs (§8.3). It then creates a **challenge**: a fresh X25519 key `D_eph`, kept only in A's session. It answers with `D_eph_pub`, its Broker ID and the blob hashes.
+2. A, or a process holding B's key on A's behalf, computes the handshake's construction (§6.2) under its own label:
+   - `ss = X25519(B_priv, D_eph_pub)`, rejecting an all-zero `ss`;
+   - `proof = HMAC-SHA256(SHA-256("nimbo/v1/delegate" ‖ ss), broker_id ‖ D_eph_pub ‖ B ‖ A ‖ flags ‖ schema_hash ‖ base_hash)`;
+   - `flags` holds `auto_reply`, `allow_stream`, and whether each hash is present. A missing hash is 32 zero bytes.
+3. A sends `delegate` with `D_eph_pub` and the proof on the same session. The Broker computes `X25519(D_eph_priv, B)` and compares the proofs in constant time. On a match it creates `{kind: mint, target = B, holder = A, lineage = id}`, with `hints` = this Broker if B has a session here, else none.
+
+**Properties.**
+- **The proof authorizes one grant.** It names the holder and the parameters, so a proof taken from A issues nothing to anyone else. A key-holding process can also check what it approves.
+- **Labels are separate.** The proof's label differs from the hello proof's (`nimbo/v1/auth`), so neither stands in for the other.
+- **What is not covered.** `durable` is the caller's choice and is not part of the proof.
+- **Challenge lifetime.** A challenge is single use: any `delegate` that names it spends it, whatever the outcome. It is valid for `delegation_ttl` (30s), only on the session that asked for it, with at most 8 outstanding per session.
+- **Errors.** A challenge that is unknown, spent, expired or from another session fails with `invalid_challenge`; a proof that does not match fails with `bad_proof`.
+- **Not gated on B.** As with MintCap and TransferCap, nothing checks B's presence. A can provision caps before B ever connects; a cap to a B that is gone fails with `target_gone` on use.
+- **No new state or traffic between Brokers.** The record format is unchanged, so Brokers that predate revision 9 store, route and validate delegated caps like any mint; they only lack the two Actions. There are no peer-protocol or presence changes.
+- **Cost and primitives.** Each challenge costs two X25519 operations, the same as a handshake. The endpoint protocol still needs only X25519, HMAC-SHA256 and SHA-256.
+
 ---
 
 ## 9. Presence, routing and messages
@@ -516,6 +543,7 @@ A **stream** is a full-duplex WebSocket pipe between a cap's holder and its targ
   - **Fast-join S3 GETs:** negative cache plus a global rate limit.
   - **Reconnect storms:** handshake buckets with burst, plus jittered `retry_after_ms`.
 - **Replay of handshake.** The broker's ephemeral key and the nonce are single-use, and the proof binds the dialed authority.
+- **Delegation (rev 9).** A delegation proof needs B's private key, as a session as B does, so delegation grants no new authority (§8.6). Its challenge key is single-use and session-bound, and the proof binds the Broker, the holder and the cap's parameters. A low-order target key yields an all-zero secret and is rejected.
 - **Payload privacy.** Brokers see payloads in clear (they must validate schemas). End-to-end encryption is a future layer and could use the endpoint X25519 keys.
 - **Stream tokens (rev 8).** A stream token is a local bearer credential: 32 random bytes, stored by its issuer only as `SHA-256(token)`, valid once, only on its issuer and for at most `stream_attach_ttl` (60s). It travels in the URL (D22), so it can appear in access logs. Brokers never log it; operators should redact `token` at load balancers. A leaked token is usable once, within 60s, on one Broker. Stream bytes are opaque to Brokers and not schema-checked; a data socket grants nothing beyond its one stream.
 
@@ -554,7 +582,7 @@ docs/protocol.md            endpoint wire protocol spec, for the ESP32 / Elixir 
 
 The deterministic simulator (`internal/sim`, [dst.md](dst.md)) drives the same `node` code. If one loop per Broker becomes the bottleneck, JSON parsing, schema validation and X25519 can move to the session goroutines without touching the state machine's semantics.
 
-**Package layout as built (rev 6):** the subsystems above are files of `internal/node` (`membership.go`, `peers.go`, `store.go`, `presence.go`, `caps.go`, `router.go`, `session.go`, and **(rev 8)** `stream.go`: half-streams, tokens and pairing) rather than separate packages, since they share one loop. Pure pieces are packages: `ids`, `placement`, `caprec` (the cap record; `cap` is a Go builtin), `presence` (registers and classification), `peerproto`, `schema`, `config`. I/O: `s3store`, `mesh` (`TS`: Tailscale data plane, with each Broker's DERP map; `TCP`: a PSK-authenticated, unencrypted development transport selected by `"mesh":"tcp"` in `cluster.json`), `host`. Tools: `cmd/nimbod`, `cmd/nimbo-sim`.
+**Package layout as built (rev 6):** the subsystems above are files of `internal/node` (`membership.go`, `peers.go`, `store.go`, `presence.go`, `caps.go`, `router.go`, `session.go`, **(rev 8)** `stream.go`: half-streams, tokens and pairing, and **(rev 9)** `delegate.go`: delegation challenges) rather than separate packages, since they share one loop. Pure pieces are packages: `ids`, `placement`, `caprec` (the cap record; `cap` is a Go builtin), `presence` (registers and classification), `peerproto`, `schema`, `config`. I/O: `s3store`, `mesh` (`TS`: Tailscale data plane, with each Broker's DERP map; `TCP`: a PSK-authenticated, unencrypted development transport selected by `"mesh":"tcp"` in `cluster.json`), `host`. Tools: `cmd/nimbod`, `cmd/nimbo-sim`.
 
 **Observability:** each Broker exposes Prometheus metrics for its stores, retry-queue depth, hinted copies, suspicion, S3 offset and fencing, plus `/debug` endpoints. `nimbod ctl` builds cluster-wide views by listing members from S3 and querying each Broker.
 
@@ -612,6 +640,9 @@ Decided with the project owner on 2026-10-12:
 | D23 | Which Broker a data socket uses (2026-10-13) | **Each side attaches to its own Broker**, which relay over the mesh. Some Brokers are not reachable from the internet on their WebSocket listener. |
 | D24 | Broker coordination for streams (2026-10-13) | **No new Broker-to-Broker control traffic and no anchor.** Only the offer's `Forward` and `Bounce` and the stream's data connection. Each side's Broker issues its own endpoint's token; endpoints see different tokens; no token leaves its issuer. |
 | D25 | Accepting and lifetime (2026-10-13) | **No accept Action.** The offer carries the target's token and the target accepts by attaching. Established streams outlive the cap and both sessions, and survive a Broker fencing itself. |
+| D26 | Delegated issuance (2026-10-14) | **An Endpoint that proves ownership of another Endpoint's key gets a cap targeting it, held by itself**, through a Broker challenge (§8.6). |
+| D27 | Delegation proof (2026-10-14) | **X25519 key agreement with a single-use Broker key, plus HMAC-SHA256**, the handshake's construction under its own label. An XEd25519 signature was considered and dropped: ECDH proves ownership and needs no new primitive. |
+| D28 | Delegated record (2026-10-14) | **`kind: mint` with `holder ≠ target`**, no new kind, so older Brokers keep decoding records during a rolling upgrade. The proof binds the holder and the cap's parameters. |
 
 ## 14. Defaults open to change
 
@@ -629,6 +660,7 @@ These were chosen without the owner; each is easy to change.
 10. **Tunables:** `replicas=3`, `virtual_ids=16`, `lookup_fanout=4`, `lookup_wait=1s`, `handoff_window=10s`, `rpc_timeout=2s`, `cap_ttl=60s`, `touch_threshold=10s`, `grace=15s`, `presence_reconcile=5m`, `presence_tombstone_ttl=10m`, location cache TTL 30s, max 2 re-routes per message.
 11. **Limits:** 64 sessions and 20 handshakes/s (burst 200) per IP; 10k live created caps per session; a 20k records/s mint admission rate per Broker; 100 held messages per target.
 12. **Streams (rev 8):** the limits of §6.4; 32 KiB relay chunks; `stream_drain_grace` 30s; no bandwidth limit (4929 is reserved for one); a target attach waits at most the 1.5s dial timeout plus 2s for the status byte.
+13. **Delegation (rev 9):** `delegation_ttl` 30s, 8 outstanding challenges and 10 `delegate_begin`/s per session.
 
 ## 15. Future work
 
