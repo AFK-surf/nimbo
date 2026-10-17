@@ -49,6 +49,11 @@ type bench struct {
 	// s3Fail, if set, makes the S3 requests it returns true for fail
 	// without taking effect.
 	s3Fail func(*Node, S3Request) bool
+	// s3Defer, if set, delays the S3 requests it returns true for before
+	// they reach the store; they take effect when the test calls the
+	// functions left in deferred.
+	s3Defer  func(*Node, S3Request) bool
+	deferred []func()
 }
 
 type benchObj struct {
@@ -132,6 +137,15 @@ func (e *benchEnv) SendSession(s SessionID, frame []byte) bool {
 }
 func (e *benchEnv) CloseSession(SessionID) {}
 func (e *benchEnv) S3(req S3Request, done func(S3Response)) {
+	b := e.b
+	if b.s3Defer != nil && b.s3Defer(e.n, req) {
+		b.deferred = append(b.deferred, func() { e.s3Now(req, done) })
+		return
+	}
+	e.s3Now(req, done)
+}
+
+func (e *benchEnv) s3Now(req S3Request, done func(S3Response)) {
 	b := e.b
 	// The request takes effect now; the response is delivered later (and
 	// can be held back by a test to reorder it against other events).

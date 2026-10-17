@@ -141,6 +141,55 @@ func TestFastJoinDoesNotRollBackIncarnation(t *testing.T) {
 	}
 }
 
+// A fast join's GET is issued, but reaches the store only after a later
+// poll admitted the member and the member then changed its object (here:
+// started draining) without its Rejoin getting through. The GET result is
+// discarded (the poll's knowledge was learned later), but it read the newer
+// object: its ETag must not be recorded, or later polls would skip that
+// object and never see the change.
+func TestDiscardedFastJoinDoesNotHideUpdate(t *testing.T) {
+	b := newBench(t, 3)
+	a, c := b.nodes[0], b.nodes[2]
+	next := a.copyMembers()
+	delete(next, c.id)
+	a.applyMembers(next)
+	b.s3Defer = func(n *Node, req S3Request) bool {
+		return n == a && req.Op == S3Get && req.Key == memberKey(c.id)
+	}
+	a.fastJoin(c.id) // issued now, reaches the store later
+	b.s3Defer = nil
+	if len(b.deferred) != 1 {
+		t.Fatalf("setup: %d deferred S3 requests, want the fast join's GET", len(b.deferred))
+	}
+	a.pollInFlight = false
+	a.poll()
+	b.drain()
+	if m := a.view.members[c.id]; m == nil || m.draining {
+		t.Fatal("setup: the poll did not admit c")
+	}
+	// c starts draining; its Rejoin does not reach a.
+	b.mute = map[ids.BrokerID]bool{c.id: true}
+	c.Drain()
+	b.drain()
+	b.mute = nil
+	if a.view.members[c.id].draining {
+		t.Fatal("setup: a learned of the drain from c itself")
+	}
+	// The fast join's GET now reads the draining object.
+	for _, f := range b.deferred {
+		f()
+	}
+	b.deferred = nil
+	b.drain()
+	// The next poll must pick the change up.
+	a.pollInFlight = false
+	a.poll()
+	b.drain()
+	if !a.view.members[c.id].draining {
+		t.Fatal("a poll after a discarded fast join missed the member's update")
+	}
+}
+
 // A poll's GET of a fresh member object fails, and a fast join issued
 // before the poll's LIST admits that member while the poll still waits for
 // its other GETs. The failed read says nothing about the member: the poll

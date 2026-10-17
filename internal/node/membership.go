@@ -522,15 +522,19 @@ func (n *Node) fastJoin(id ids.BrokerID) {
 			n.fastJoinNeg[id] = n.now().Add(n.tun.FastJoinNegTTL)
 			return
 		}
-		n.knownETags[id] = r.ETag
 		if cur := n.view.members[id]; cur != nil && cur.learned > issued {
 			// Admitted meanwhile (a poll, a Rejoin, or a frame carrying
-			// its incarnation) by knowledge newer than this GET. The
-			// object can lag behind the process (its PUTs may be failing
-			// while its frames get through), so applying it could roll
-			// a restart back and declare the live incarnation departed.
+			// its incarnation) by knowledge newer than this GET was
+			// issued. The object can lag behind the process (its PUTs
+			// may be failing while its frames get through), so applying
+			// it could roll a restart back and declare the live
+			// incarnation departed. Its ETag is not recorded either: the
+			// GET may have reached the store late and read an object
+			// newer than the view, and a recorded ETag would make later
+			// polls skip it for as long as it stays unchanged.
 			return
 		}
+		n.knownETags[id] = r.ETag
 		m.lastSeen, m.learned = r.LastModified, issued
 		next := n.copyMembers()
 		next[id] = m
