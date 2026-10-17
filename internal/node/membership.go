@@ -504,8 +504,16 @@ func (n *Node) fastJoin(id ids.BrokerID) {
 			n.fastJoinNeg[id] = n.now().Add(n.tun.FastJoinNegTTL)
 			return
 		}
-		m.lastSeen, m.learned = r.LastModified, issued
 		n.knownETags[id] = r.ETag
+		if cur := n.view.members[id]; cur != nil && cur.learned > issued {
+			// Admitted meanwhile (a poll, a Rejoin, or a frame carrying
+			// its incarnation) by knowledge newer than this GET. The
+			// object can lag behind the process (its PUTs may be failing
+			// while its frames get through), so applying it could roll
+			// a restart back and declare the live incarnation departed.
+			return
+		}
+		m.lastSeen, m.learned = r.LastModified, issued
 		next := n.copyMembers()
 		next[id] = m
 		n.applyMembers(next)

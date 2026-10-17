@@ -3,6 +3,7 @@ package node
 import (
 	"fmt"
 	"github.com/afk-surf/nimbo/internal/ids"
+	"github.com/afk-surf/nimbo/internal/peerproto"
 	"testing"
 	"time"
 )
@@ -82,6 +83,61 @@ func TestPollDoesNotRollBackIncarnation(t *testing.T) {
 	}
 	if _, gone := a.departed[regKey(c2.id, c2.inc)]; gone {
 		t.Fatal("the new incarnation was marked departed")
+	}
+}
+
+// A fast join's GET can return a member object older than what the Broker
+// learned while it was in flight: the member restarted (or unfenced) and its
+// Rejoin or frames arrived first, possibly while its PUTs were failing. The
+// stale object must not roll the incarnation back: that would declare the
+// live incarnation departed and tombstone its presence registers, which
+// nothing repairs until the owner's periodic reconcile (nightly DST seed
+// 3950053).
+func TestFastJoinDoesNotRollBackIncarnation(t *testing.T) {
+	b := newBench(t, 3)
+	a, c := b.nodes[0], b.nodes[2]
+	// a does not know c (as right after a restart), and fast-joins it; the
+	// GET reads c's object now, but its response is held.
+	next := a.copyMembers()
+	delete(next, c.id)
+	a.applyMembers(next)
+	b.holdS3[a] = true
+	a.fastJoin(c.id)
+	if len(b.heldList) != 1 {
+		t.Fatalf("setup: %d held S3 responses, want the fast join's GET", len(b.heldList))
+	}
+	// c comes back as a new incarnation and a learns it from c itself.
+	oldInc := c.inc
+	c.newIncarnation()
+	c.applyMembers(c.copyMembers())
+	a.handleRejoin(c.id, &peerproto.Rejoin{Member: c.memberJSON()})
+	if a.view.members[c.id] == nil || a.view.members[c.id].inc != c.inc {
+		t.Fatal("setup: a did not learn the new incarnation")
+	}
+	// An endpoint on c: with 3 Brokers and 3 replicas, a holds its register.
+	ep := b.connect(c)
+	b.drain()
+	rk := regKey(c.id, c.inc)
+	pr := a.pres[ep.key]
+	if pr == nil || pr.regs[rk].Tomb || pr.regs[rk].Sessions != 1 {
+		t.Fatal("setup: a does not hold the live register")
+	}
+	// Now the GET response (c's object under the old incarnation) arrives.
+	b.holdS3[a] = false
+	h := b.heldList
+	b.heldList = nil
+	for _, f := range h {
+		f()
+	}
+	b.drain()
+	if got := a.view.members[c.id].inc; got != c.inc {
+		t.Fatalf("a rolled the incarnation back from %x to %x (old %x)", c.inc, got, oldInc)
+	}
+	if _, gone := a.departed[rk]; gone {
+		t.Fatal("the live incarnation was marked departed")
+	}
+	if pr.regs[rk].Tomb {
+		t.Fatal("the live presence register was tombstoned")
 	}
 }
 
