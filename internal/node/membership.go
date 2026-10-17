@@ -274,6 +274,9 @@ func (n *Node) poll() {
 			lm   time.Time
 		}
 		var needs []need
+		// failed holds members whose object the LIST shows as fresh but
+		// whose GET failed: their state is unknown, not absent.
+		failed := map[ids.BrokerID]bool{}
 		s3now := n.s3Now()
 		for _, o := range r.Objects {
 			id, ok := parseMemberKey(o.Key)
@@ -306,7 +309,19 @@ func (n *Node) poll() {
 			// a restart or a draining flag.
 			for _, id := range sortedBrokerKeys(n.view.members) {
 				cur := n.view.members[id]
-				if id == n.id || cur.learned <= listStart {
+				if id == n.id {
+					continue
+				}
+				if failed[id] && next[id] == nil {
+					// Admitted while its GET failed (by a fast join issued
+					// before the LIST): as on a LIST error, expire nobody
+					// on a failed read. Dropping it would declare its live
+					// incarnation departed until it is re-admitted.
+					c := *cur
+					next[id] = &c
+					continue
+				}
+				if cur.learned <= listStart {
 					continue
 				}
 				if nx := next[id]; nx == nil || cur.learned > nx.learned {
@@ -339,9 +354,12 @@ func (n *Node) poll() {
 						next[nd.id] = m
 						n.knownETags[nd.id] = nd.etag
 					}
-				} else if cur := n.view.members[nd.id]; cur != nil && g.Err != nil {
-					m := *cur
-					next[nd.id] = &m
+				} else if g.Err != nil {
+					failed[nd.id] = true
+					if cur := n.view.members[nd.id]; cur != nil {
+						m := *cur
+						next[nd.id] = &m
+					}
 				}
 				left--
 				if left == 0 {
@@ -504,8 +522,20 @@ func (n *Node) fastJoin(id ids.BrokerID) {
 			n.fastJoinNeg[id] = n.now().Add(n.tun.FastJoinNegTTL)
 			return
 		}
-		m.lastSeen, m.learned = r.LastModified, issued
+		if cur := n.view.members[id]; cur != nil && cur.learned > issued {
+			// Admitted meanwhile (a poll, a Rejoin, or a frame carrying
+			// its incarnation) by knowledge newer than this GET was
+			// issued. The object can lag behind the process (its PUTs
+			// may be failing while its frames get through), so applying
+			// it could roll a restart back and declare the live
+			// incarnation departed. Its ETag is not recorded either: the
+			// GET may have reached the store late and read an object
+			// newer than the view, and a recorded ETag would make later
+			// polls skip it for as long as it stays unchanged.
+			return
+		}
 		n.knownETags[id] = r.ETag
+		m.lastSeen, m.learned = r.LastModified, issued
 		next := n.copyMembers()
 		next[id] = m
 		n.applyMembers(next)

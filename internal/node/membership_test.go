@@ -3,6 +3,7 @@ package node
 import (
 	"fmt"
 	"github.com/afk-surf/nimbo/internal/ids"
+	"github.com/afk-surf/nimbo/internal/peerproto"
 	"testing"
 	"time"
 )
@@ -82,6 +83,166 @@ func TestPollDoesNotRollBackIncarnation(t *testing.T) {
 	}
 	if _, gone := a.departed[regKey(c2.id, c2.inc)]; gone {
 		t.Fatal("the new incarnation was marked departed")
+	}
+}
+
+// A fast join's GET can return a member object older than what the Broker
+// learned while it was in flight: the member restarted (or unfenced) and its
+// Rejoin or frames arrived first, possibly while its PUTs were failing. The
+// stale object must not roll the incarnation back: that would declare the
+// live incarnation departed and tombstone its presence registers, which
+// nothing repairs until the owner's periodic reconcile (nightly DST seed
+// 3950053).
+func TestFastJoinDoesNotRollBackIncarnation(t *testing.T) {
+	b := newBench(t, 3)
+	a, c := b.nodes[0], b.nodes[2]
+	// a does not know c (as right after a restart), and fast-joins it; the
+	// GET reads c's object now, but its response is held.
+	next := a.copyMembers()
+	delete(next, c.id)
+	a.applyMembers(next)
+	b.holdS3[a] = true
+	a.fastJoin(c.id)
+	if len(b.heldList) != 1 {
+		t.Fatalf("setup: %d held S3 responses, want the fast join's GET", len(b.heldList))
+	}
+	// c comes back as a new incarnation and a learns it from c itself.
+	oldInc := c.inc
+	c.newIncarnation()
+	c.applyMembers(c.copyMembers())
+	a.handleRejoin(c.id, &peerproto.Rejoin{Member: c.memberJSON()})
+	if a.view.members[c.id] == nil || a.view.members[c.id].inc != c.inc {
+		t.Fatal("setup: a did not learn the new incarnation")
+	}
+	// An endpoint on c: with 3 Brokers and 3 replicas, a holds its register.
+	ep := b.connect(c)
+	b.drain()
+	rk := regKey(c.id, c.inc)
+	pr := a.pres[ep.key]
+	if pr == nil || pr.regs[rk].Tomb || pr.regs[rk].Sessions != 1 {
+		t.Fatal("setup: a does not hold the live register")
+	}
+	// Now the GET response (c's object under the old incarnation) arrives.
+	b.holdS3[a] = false
+	h := b.heldList
+	b.heldList = nil
+	for _, f := range h {
+		f()
+	}
+	b.drain()
+	if got := a.view.members[c.id].inc; got != c.inc {
+		t.Fatalf("a rolled the incarnation back from %x to %x (old %x)", c.inc, got, oldInc)
+	}
+	if _, gone := a.departed[rk]; gone {
+		t.Fatal("the live incarnation was marked departed")
+	}
+	if pr.regs[rk].Tomb {
+		t.Fatal("the live presence register was tombstoned")
+	}
+}
+
+// A fast join's GET is issued, but reaches the store only after a later
+// poll admitted the member and the member then changed its object (here:
+// started draining) without its Rejoin getting through. The GET result is
+// discarded (the poll's knowledge was learned later), but it read the newer
+// object: its ETag must not be recorded, or later polls would skip that
+// object and never see the change.
+func TestDiscardedFastJoinDoesNotHideUpdate(t *testing.T) {
+	b := newBench(t, 3)
+	a, c := b.nodes[0], b.nodes[2]
+	next := a.copyMembers()
+	delete(next, c.id)
+	a.applyMembers(next)
+	b.s3Defer = func(n *Node, req S3Request) bool {
+		return n == a && req.Op == S3Get && req.Key == memberKey(c.id)
+	}
+	a.fastJoin(c.id) // issued now, reaches the store later
+	b.s3Defer = nil
+	if len(b.deferred) != 1 {
+		t.Fatalf("setup: %d deferred S3 requests, want the fast join's GET", len(b.deferred))
+	}
+	a.pollInFlight = false
+	a.poll()
+	b.drain()
+	if m := a.view.members[c.id]; m == nil || m.draining {
+		t.Fatal("setup: the poll did not admit c")
+	}
+	// c starts draining; its Rejoin does not reach a.
+	b.mute = map[ids.BrokerID]bool{c.id: true}
+	c.Drain()
+	b.drain()
+	b.mute = nil
+	if a.view.members[c.id].draining {
+		t.Fatal("setup: a learned of the drain from c itself")
+	}
+	// The fast join's GET now reads the draining object.
+	for _, f := range b.deferred {
+		f()
+	}
+	b.deferred = nil
+	b.drain()
+	// The next poll must pick the change up.
+	a.pollInFlight = false
+	a.poll()
+	b.drain()
+	if !a.view.members[c.id].draining {
+		t.Fatal("a poll after a discarded fast join missed the member's update")
+	}
+}
+
+// A poll's GET of a fresh member object fails, and a fast join issued
+// before the poll's LIST admits that member while the poll still waits for
+// its other GETs. The failed read says nothing about the member: the poll
+// must not drop it (which would declare its live incarnation departed and
+// tombstone its presence registers until it is re-admitted; nightly DST
+// seed 7050039).
+func TestPollDoesNotDropMemberOnFailedGet(t *testing.T) {
+	b := newBench(t, 3)
+	a, other, c := b.nodes[0], b.nodes[1], b.nodes[2]
+	// a knows neither (as right after a restart), so its poll GETs both.
+	next := a.copyMembers()
+	delete(next, other.id)
+	delete(next, c.id)
+	a.applyMembers(next)
+	b.holdS3[a] = true
+	a.fastJoin(c.id) // issued before the LIST
+	a.pollInFlight = false
+	a.poll()
+	h := b.heldList
+	b.heldList = nil
+	if len(h) != 2 {
+		t.Fatalf("setup: %d held S3 responses, want the fast join's GET and the LIST", len(h))
+	}
+	fastJoinGet, list := h[0], h[1]
+	b.s3Fail = func(n *Node, req S3Request) bool { return n == a && req.Key == memberKey(c.id) }
+	list() // the poll issues its GETs: c's fails, other's succeeds
+	b.s3Fail = nil
+	gets := b.heldList
+	b.heldList = nil
+	if len(gets) != 2 {
+		t.Fatalf("setup: %d GETs, want 2", len(gets))
+	}
+	var cGet, otherGet func()
+	if sortedBrokerKeys(map[ids.BrokerID]bool{other.id: true, c.id: true})[0] == c.id {
+		cGet, otherGet = gets[0], gets[1]
+	} else {
+		cGet, otherGet = gets[1], gets[0]
+	}
+	cGet()        // fails
+	fastJoinGet() // admits c
+	if a.view.members[c.id] == nil {
+		t.Fatal("setup: the fast join did not admit c")
+	}
+	otherGet() // the poll finishes
+	b.holdS3[a] = false
+	if a.view.members[c.id] == nil {
+		t.Fatal("a failed GET dropped a member")
+	}
+	if _, gone := a.departed[regKey(c.id, c.inc)]; gone {
+		t.Fatal("the live incarnation was marked departed")
+	}
+	if a.view.members[other.id] == nil {
+		t.Fatal("the poll did not admit the other member")
 	}
 }
 
