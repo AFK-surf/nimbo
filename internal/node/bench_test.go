@@ -46,6 +46,9 @@ type bench struct {
 	mute     map[ids.BrokerID]bool // frames from these Brokers are not sent
 	tune     func(*Tunables)       // applied to Brokers added from now on
 	lists    map[*Node]int         // S3 LISTs per Broker
+	// s3Fail, if set, makes the S3 requests it returns true for fail
+	// without taking effect.
+	s3Fail func(*Node, S3Request) bool
 }
 
 type benchObj struct {
@@ -133,7 +136,11 @@ func (e *benchEnv) S3(req S3Request, done func(S3Response)) {
 	// The request takes effect now; the response is delivered later (and
 	// can be held back by a test to reorder it against other events).
 	resp := S3Response{Date: b.now.Truncate(time.Second)}
-	switch req.Op {
+	op := req.Op
+	if b.s3Fail != nil && b.s3Fail(e.n, req) {
+		resp.Err, op = fmt.Errorf("injected S3 failure"), -1
+	}
+	switch op {
 	case S3Put:
 		b.s3[req.Key] = benchObj{body: append([]byte(nil), req.Body...), lm: b.now}
 		resp.ETag = fmt.Sprint(len(req.Body), string(req.Body))

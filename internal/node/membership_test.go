@@ -141,6 +141,62 @@ func TestFastJoinDoesNotRollBackIncarnation(t *testing.T) {
 	}
 }
 
+// A poll's GET of a fresh member object fails, and a fast join issued
+// before the poll's LIST admits that member while the poll still waits for
+// its other GETs. The failed read says nothing about the member: the poll
+// must not drop it (which would declare its live incarnation departed and
+// tombstone its presence registers until it is re-admitted; nightly DST
+// seed 7050039).
+func TestPollDoesNotDropMemberOnFailedGet(t *testing.T) {
+	b := newBench(t, 3)
+	a, other, c := b.nodes[0], b.nodes[1], b.nodes[2]
+	// a knows neither (as right after a restart), so its poll GETs both.
+	next := a.copyMembers()
+	delete(next, other.id)
+	delete(next, c.id)
+	a.applyMembers(next)
+	b.holdS3[a] = true
+	a.fastJoin(c.id) // issued before the LIST
+	a.pollInFlight = false
+	a.poll()
+	h := b.heldList
+	b.heldList = nil
+	if len(h) != 2 {
+		t.Fatalf("setup: %d held S3 responses, want the fast join's GET and the LIST", len(h))
+	}
+	fastJoinGet, list := h[0], h[1]
+	b.s3Fail = func(n *Node, req S3Request) bool { return n == a && req.Key == memberKey(c.id) }
+	list() // the poll issues its GETs: c's fails, other's succeeds
+	b.s3Fail = nil
+	gets := b.heldList
+	b.heldList = nil
+	if len(gets) != 2 {
+		t.Fatalf("setup: %d GETs, want 2", len(gets))
+	}
+	var cGet, otherGet func()
+	if sortedBrokerKeys(map[ids.BrokerID]bool{other.id: true, c.id: true})[0] == c.id {
+		cGet, otherGet = gets[0], gets[1]
+	} else {
+		cGet, otherGet = gets[1], gets[0]
+	}
+	cGet()        // fails
+	fastJoinGet() // admits c
+	if a.view.members[c.id] == nil {
+		t.Fatal("setup: the fast join did not admit c")
+	}
+	otherGet() // the poll finishes
+	b.holdS3[a] = false
+	if a.view.members[c.id] == nil {
+		t.Fatal("a failed GET dropped a member")
+	}
+	if _, gone := a.departed[regKey(c.id, c.inc)]; gone {
+		t.Fatal("the live incarnation was marked departed")
+	}
+	if a.view.members[other.id] == nil {
+		t.Fatal("the poll did not admit the other member")
+	}
+}
+
 // A joiner whose frames cannot reach the existing Brokers (over the
 // Tailscale mesh, magicsock drops packets from unknown keys) must still be
 // admitted within about one signal poll, not one full poll: it rewrites
